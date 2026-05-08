@@ -1,0 +1,21 @@
+name = "hongxin-backend"
+main = "src/index.js"
+compatibility_date = "2024-12-01"
+
+# After deploy, set provider keys (only the ones you want enabled):
+#   wrangler secret put ANTHROPIC_API_KEY
+#   wrangler secret put OPENAI_API_KEY
+#   wrangler secret put DOUBAO_API_KEY
+#   wrangler secret put QWEN_API_KEY
+#   wrangler secret put DEEPSEEK_API_KEY
+#   wrangler secret put ZHIPU_API_KEY
+#
+# Optional shared-token gate (recommended for public deploys to protect your token bill):
+#   wrangler secret put ACCESS_TOKEN
+# Then set VITE_BACKEND_TOKEN to the same value when building the frontend.
+
+[vars]
+# Comma-separated origin allowlist; "*" = allow any origin (open to the world).
+# For private/team use, narrow this:
+# ALLOWED_ORIGINS = "https://your-team.example.com,http://localhost:5173"
+ALLOWED_ORIGINS = "*"

@@ -1,0 +1,14 @@
+# Copy to .dev.vars and fill in your keys for `wrangler dev`.
+# In production, use `wrangler secret put <NAME>` instead — never commit real keys.
+
+ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxx
+OPENAI_API_KEY=sk-xxxxxxxxxxxx
+
+# Optional providers
+# DOUBAO_API_KEY=xxx
+# QWEN_API_KEY=sk-xxx
+# DEEPSEEK_API_KEY=sk-xxx
+# ZHIPU_API_KEY=xxx
+
+# Optional shared-secret gate (recommended for public deployments)
+# ACCESS_TOKEN=some-long-random-string

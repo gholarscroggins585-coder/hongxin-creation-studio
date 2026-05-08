@@ -37,7 +37,7 @@ npm run dev      # 本地起 http://localhost:5173
 ### 部署 Worker（一次性 5 分钟）
 
 ```bash
-cd ../worker
+cd worker
 npm install
 npx wrangler login                          # 登录 Cloudflare 账号
 npx wrangler secret put ANTHROPIC_API_KEY   # 输入你的 Anthropic Key
@@ -75,7 +75,7 @@ VITE_BACKEND_TOKEN=<同样的随机字符串>
 
 ✓ 部署完，访客打开网站直接看到「✓ 已接入托管后端 · 开箱即用」绿色横幅，无需任何配置即可使用所有 AI 能力。访客可选择填入个人 Key 覆盖托管后端（仅他自己浏览器生效）。
 
-详细 Worker 文档见 [`worker/`](../worker/) 目录。
+详细 Worker 文档见 [`worker/`](./worker/) 目录。
 
 ## 解决 CORS（国产模型 / 图像 / URL 抓取）
 
