@@ -172,6 +172,66 @@ async function testApiKey(providerId, apiKey, baseUrl) {
   return await callAI({ keys: testKeys, routes: testRoutes, scene: "test", prompt: "Say OK", maxTokens: 10 });
 }
 
+function safeParseJson(text) {
+  if (!text) throw new Error("AI 返回为空");
+  let s = String(text).trim();
+  s = s.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
+  try { return JSON.parse(s); } catch {}
+  const start = s.indexOf("{");
+  const end = s.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    return JSON.parse(s.slice(start, end + 1));
+  }
+  throw new Error("AI 返回的不是合法 JSON");
+}
+
+async function runAgentValidation({ agent, source, keys, routes }) {
+  const note = source?.note || {};
+  const topic = source?.topics?.[0]?.title || source?.keyword || "（用户未指定选题）";
+  const imagePrompts = Array.isArray(source?.imagePrompts) ? source.imagePrompts : [];
+  const points = Array.isArray(note.points) ? note.points.join("\n") : "";
+  const tags = Array.isArray(note.tags) ? note.tags.join(" ") : "";
+
+  const systemPrompt = `你是「${agent.name}」（${agent.role}），小红书素人爆文内容评审专家，专注于：${agent.criteria.join("、")}。
+你只对自己专业维度作出评分和反馈，不要越界点评其他维度。
+反馈必须具体、可执行，不要泛泛而谈。
+严格输出 JSON，不要任何 Markdown 代码块或额外说明。`;
+
+  const userPrompt = `请按你的专业维度（${agent.criteria.join("、")}）评估以下小红书素人笔记。
+
+【选题】${topic}
+【钩子】${note.hook || "（缺失）"}
+【痛点开场】${note.painOpen || "（缺失）"}
+【正文要点】
+${points || "（缺失）"}
+【个人经验】${note.personalExp || "（缺失）"}
+【建议】${note.suggestion || "（缺失）"}
+【收尾】${note.end || "（缺失）"}
+【标签】${tags || "（缺失）"}
+【封面/内页配图描述】
+${imagePrompts.length ? imagePrompts.join("\n---\n") : "（用户未提供配图描述）"}
+
+打 0-100 分（标准要严，越严越有用），并给出 1-2 条具体优势 + 1-2 条具体可改进点，每条不超过 30 字。
+
+严格按以下 JSON 格式返回，不要任何额外文本：
+{"score": 数字, "strengths": ["...", "..."], "improvements": ["...", "..."]}`;
+
+  const text = await callAI({
+    keys, routes,
+    scene: "Agent验证",
+    systemPrompt,
+    prompt: userPrompt,
+    maxTokens: 700,
+  });
+  const parsed = safeParseJson(text);
+  let score = Number(parsed.score);
+  if (!Number.isFinite(score)) score = 0;
+  score = Math.max(0, Math.min(100, Math.round(score)));
+  const strengths = Array.isArray(parsed.strengths) ? parsed.strengths.filter(Boolean).map(String) : [];
+  const improvements = Array.isArray(parsed.improvements) ? parsed.improvements.filter(Boolean).map(String) : [];
+  return { score, strengths, improvements };
+}
+
 function readFileAsDataUrl(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -754,34 +814,107 @@ function Step1({ onNext }) {
 }
 
 function Step2({ onNext, source }) {
-  const [phase, setPhase] = useState(-1);
+  const { keys, routes } = useContext(ApiConfigContext);
+  const hasAI = isBackendMode() || Object.values(keys).some(k => k?.key);
+  const hasNote = !!source?.note;
+
   const [scores, setScores] = useState(AGENTS_DATA.map(()=>null));
+  const [reports, setReports] = useState(AGENTS_DATA.map(()=>null));
+  const [errors, setErrors] = useState(AGENTS_DATA.map(()=>null));
   const [running, setRunning] = useState(false);
-  const start = () => { setRunning(true); setScores(AGENTS_DATA.map(()=>null)); setPhase(0); };
-  useEffect(() => {
-    if (phase<0||phase>=AGENTS_DATA.length) { if(phase===AGENTS_DATA.length) setRunning(false); return; }
-    const t = setTimeout(() => {
-      setScores(s => { const n=[...s]; n[phase] = 82+Math.floor(Math.random()*14); return n; });
-      setPhase(p=>p+1);
-    }, 1100);
-    return ()=>clearTimeout(t);
-  }, [phase]);
-  const overall = scores.filter(s=>s!=null).length===AGENTS_DATA.length ? Math.round(scores.reduce((a,b)=>a+b,0)/AGENTS_DATA.length) : null;
+  const [hasRun, setHasRun] = useState(false);
+
+  const start = async () => {
+    if (!hasNote) return;
+    setRunning(true); setHasRun(true);
+    setScores(AGENTS_DATA.map(()=>null));
+    setReports(AGENTS_DATA.map(()=>null));
+    setErrors(AGENTS_DATA.map(()=>null));
+
+    if (!hasAI) {
+      // Fallback: simulated progressive scoring (无 Key 时演示模式)
+      for (let i = 0; i < AGENTS_DATA.length; i++) {
+        await new Promise(r => setTimeout(r, 800));
+        setScores(s => { const n=[...s]; n[i] = 82 + Math.floor(Math.random()*14); return n; });
+      }
+      setRunning(false);
+      return;
+    }
+
+    // Real parallel AI calls — each agent scores its own dimension independently
+    await Promise.all(AGENTS_DATA.map(async (agent, i) => {
+      try {
+        const result = await runAgentValidation({ agent, source, keys, routes });
+        setScores(s => { const n=[...s]; n[i] = result.score; return n; });
+        setReports(r => { const n=[...r]; n[i] = result; return n; });
+      } catch (e) {
+        setErrors(es => { const n=[...es]; n[i] = (e?.message || "调用失败").slice(0, 140); return n; });
+        setScores(s => { const n=[...s]; n[i] = 0; return n; });
+      }
+    }));
+    setRunning(false);
+  };
+
+  // Auto-run once on mount when ready
+  useEffect(() => { if (hasNote && !hasRun) start(); /* eslint-disable-next-line */ }, []);
+
+  const completed = scores.filter(s => s !== null).length;
+  const overall = completed === AGENTS_DATA.length
+    ? Math.round(scores.reduce((a,b)=>a+(b||0),0) / AGENTS_DATA.length)
+    : null;
+
+  // Aggregate strengths/improvements (only when real AI reports exist)
+  const aggStrengths = reports.flatMap((r, idx) =>
+    r ? (r.strengths || []).map(s => ({ agent: AGENTS_DATA[idx].name, text: s })) : []
+  );
+  const aggImprovements = reports.flatMap((r, idx) =>
+    r ? (r.improvements || []).map(s => ({ agent: AGENTS_DATA[idx].name, text: s })) : []
+  );
+
   return (
     <div>
       <div style={S.banner}>
         <div style={S.icoWrap}><I.Shield size={16}/></div>
         <div style={{ flex:1 }}>
           <div style={{ fontWeight:700 }}>当前选题：{source?.topics?.[0]?.title || source?.keyword || "请先在上一步选择一个选题"}</div>
-          <div style={{ color:"var(--ink3)", fontSize:12 }}>对已生成的文案 + 封面综合打分，得分 ≥ 80 才进入下一步。</div>
+          <div style={{ color:"var(--ink3)", fontSize:12 }}>
+            {hasAI
+              ? "5 个 Agent 并行评审已生成的文案 + 封面，得分 ≥ 80 才进入下一步。"
+              : "⚡ 当前为示例模式 · 配置 API Key 后将调用真实 AI 评分。"}
+          </div>
         </div>
-        <Btn primary disabled={running} onClick={start}>{running ? "验证中…" : <><I.Bolt size={14}/> 开始验证</>}</Btn>
+        <Btn primary disabled={running || !hasNote} onClick={start}>
+          {running ? "验证中…" : completed === AGENTS_DATA.length ? <><I.Bolt size={14}/> 重新验证</> : <><I.Bolt size={14}/> 开始验证</>}
+        </Btn>
       </div>
+
+      {!hasNote && (
+        <Card style={{ marginTop:14, background:"var(--amberSoft)", borderColor:"transparent" }}>
+          <div style={{ fontSize:13, color:"var(--amberDeep)" }}>⚠ 还没有可验证的文案。请先回到「文案结构生成」完成上一步。</div>
+        </Card>
+      )}
+
       <div style={{ display:"flex", gap:14, flexWrap:"wrap", marginTop:14 }}>
-        {AGENTS_DATA.map((a,i) => {
-          const st = i<phase ? "done" : i===phase ? "active" : "idle";
+        {AGENTS_DATA.map((a, i) => {
+          const score = scores[i];
+          const err = errors[i];
+          const st = err ? "error" : score !== null ? "done" : running ? "active" : "idle";
+          const borderColor = st === "active" ? "var(--brand)"
+            : st === "done" ? "var(--mint)"
+            : st === "error" ? "oklch(0.7 0.18 25)"
+            : "var(--line)";
+          const statusColor = st === "active" ? "var(--brandDeep)"
+            : st === "done" ? "var(--mintDeep)"
+            : st === "error" ? "oklch(0.5 0.22 25)"
+            : "var(--ink4)";
+          const statusText = st === "done" ? "✓ 已评分"
+            : st === "active" ? "● 评估中…"
+            : st === "error" ? "✗ 调用失败"
+            : "等待中";
+          const scoreColor = st==="done" ? "var(--mintDeep)" : st==="error" ? "oklch(0.5 0.22 25)" : "var(--ink4)";
+          const barColor = st==="done" ? "var(--mint)" : st==="error" ? "oklch(0.7 0.18 25)" : "var(--brand)";
           return (
-            <div key={a.id} style={{ flex:"1 1 0", minWidth:165, background:"var(--surface)", border:`1px solid ${st==="active" ? "var(--brand)" : st==="done" ? "var(--mint)" : "var(--line)"}`,
+            <div key={a.id} style={{ flex:"1 1 0", minWidth:165, background:"var(--surface)", border:`1px solid ${borderColor}`,
               borderRadius:14, padding:14, display:"flex", flexDirection:"column", gap:10, opacity: st==="idle" ? 0.55 : 1, boxShadow: st==="active" ? "0 0 0 3px var(--brandSoft)" : "none", transition:"all .25s" }}>
               <div style={{ display:"flex", gap:10, alignItems:"center" }}>
                 <div style={{ width:48, height:48, borderRadius:"50%", background:a.color, display:"grid", placeItems:"center", fontSize:22 }}>{a.emoji}</div>
@@ -791,38 +924,49 @@ function Step2({ onNext, source }) {
                 </div>
               </div>
               <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
-                <span style={{ fontSize:11, fontWeight:600, color: st==="active" ? "var(--brandDeep)" : st==="done" ? "var(--mintDeep)" : "var(--ink4)" }}>
-                  {st==="done" ? "✓ 已通过" : st==="active" ? "● 分析中…" : "等待中"}
-                </span>
-                <span style={{ fontFamily:"var(--mono)", fontSize:22, fontWeight:700, color: st==="done" ? "var(--mintDeep)" : "var(--ink4)" }}>{scores[i]??""}</span>
+                <span style={{ fontSize:11, fontWeight:600, color: statusColor }}>{statusText}</span>
+                <span style={{ fontFamily:"var(--mono)", fontSize:22, fontWeight:700, color: scoreColor }}>{score ?? ""}</span>
               </div>
-              <div style={S.hairline}><span style={{ display:"block", height:"100%", width:`${scores[i]||0}%`, background: st==="done" ? "var(--mint)" : "var(--brand)", borderRadius:999, transition:"width .8s cubic-bezier(.2,.8,.2,1)" }}/></div>
+              <div style={S.hairline}><span style={{ display:"block", height:"100%", width:`${score||0}%`, background: barColor, borderRadius:999, transition:"width .8s cubic-bezier(.2,.8,.2,1)" }}/></div>
               <div style={{ display:"flex", gap:4, flexWrap:"wrap" }}>{a.criteria.map(c => <Chip key={c} style={{ fontSize:10 }}>{c}</Chip>)}</div>
+              {err && <div style={{ fontSize:10, color:"oklch(0.5 0.22 25)", lineHeight:1.4 }}>⚠ {err}</div>}
             </div>
           );
         })}
       </div>
+
       <Card style={{ marginTop:14 }}>
         <div style={S.cardH}>
-          <div><div style={S.cardTitle}>综合诊断</div><div style={S.cardSub}>综合 5 个 Agent 的修改建议</div></div>
-          {overall!=null && <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+          <div>
+            <div style={S.cardTitle}>综合诊断</div>
+            <div style={S.cardSub}>{aggStrengths.length || aggImprovements.length ? `汇总 ${reports.filter(Boolean).length} 个 Agent 的真实反馈` : "5 个 Agent 的修改建议"}</div>
+          </div>
+          {overall != null && <div style={{ display:"flex", alignItems:"center", gap:8 }}>
             <span style={{ fontFamily:"var(--mono)", fontSize:24, fontWeight:700, color: overall>=80 ? "var(--mintDeep)" : "var(--amberDeep)" }}>{overall}</span>
-            <Chip variant={overall>=85?"mint":"amber"}>{overall>=85?"强烈推荐":"建议优化"}</Chip>
+            <Chip variant={overall>=85?"mint":overall>=80?"brand":"amber"}>{overall>=85?"强烈推荐":overall>=80?"通过":"建议优化"}</Chip>
           </div>}
         </div>
         <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
           <div style={{ padding:12, background:"var(--mintSoft)", borderRadius:10 }}>
             <div style={{ fontSize:11, fontWeight:700, color:"var(--mintDeep)", marginBottom:6 }}>✓ 优势</div>
-            <div style={{ fontSize:12, lineHeight:1.6 }}>• 钩子开篇贴近真实场景，停留率预估高<br/>• 文案+封面信息一致，主题表达清晰<br/>• 具备「踩坑→复盘」自然叙事结构</div>
+            <div style={{ fontSize:12, lineHeight:1.6 }}>
+              {aggStrengths.length > 0
+                ? aggStrengths.map((s, i) => <div key={i} style={{ marginBottom:3 }}>• <span style={{color:"var(--ink3)", fontSize:11}}>[{s.agent}]</span> {s.text}</div>)
+                : <>• 钩子开篇贴近真实场景，停留率预估高<br/>• 文案+封面信息一致，主题表达清晰<br/>• 具备「踩坑→复盘」自然叙事结构</>}
+            </div>
           </div>
           <div style={{ padding:12, background:"var(--amberSoft)", borderRadius:10 }}>
             <div style={{ fontSize:11, fontWeight:700, color:"var(--amberDeep)", marginBottom:6 }}>⚡ 改进方向</div>
-            <div style={{ fontSize:12, lineHeight:1.6 }}>• 钩子改为反向问句更易停留<br/>• 正文增加「我家娃」具体细节<br/>• 封面建议手写体+实拍场景</div>
+            <div style={{ fontSize:12, lineHeight:1.6 }}>
+              {aggImprovements.length > 0
+                ? aggImprovements.map((s, i) => <div key={i} style={{ marginBottom:3 }}>• <span style={{color:"var(--ink3)", fontSize:11}}>[{s.agent}]</span> {s.text}</div>)
+                : <>• 钩子改为反向问句更易停留<br/>• 正文增加「我家娃」具体细节<br/>• 封面建议手写体+实拍场景</>}
+            </div>
           </div>
         </div>
       </Card>
       <div style={{ display:"flex", justifyContent:"flex-end", marginTop:18 }}>
-        <Btn primary style={{ padding:"11px 18px" }} disabled={overall==null} onClick={onNext}>下一步：审阅导出 <I.Arrow size={14}/></Btn>
+        <Btn primary style={{ padding:"11px 18px" }} disabled={overall==null} onClick={() => onNext({ validationOverall: overall, validationReports: reports.filter(Boolean) })}>下一步：审阅导出 <I.Arrow size={14}/></Btn>
       </div>
     </div>
   );
@@ -1180,7 +1324,7 @@ function Step5({ source }) {
           <div style={{ width:48, height:48, borderRadius:14, background:"var(--mint)", color:"white", display:"grid", placeItems:"center", flex:"0 0 48px" }}><I.Check size={24}/></div>
           <div style={{ flex:1 }}>
             <div style={{ fontSize:16, fontWeight:700 }}>笔记已生成完成 🎉</div>
-            <div style={{ fontSize:13, color:"var(--ink2)" }}>共 1 篇笔记 · {images.filter(Boolean).length || 6} 张图 · 约{noteContent.length}字 · 综合得分 89 · 痛点→方案→经验→标签</div>
+            <div style={{ fontSize:13, color:"var(--ink2)" }}>共 1 篇笔记 · {images.filter(Boolean).length || 6} 张图 · 约{noteContent.length}字 · 综合得分 {source?.validationOverall ?? "—"} · 痛点→方案→经验→标签</div>
           </div>
           <Btn onClick={saveToMaterials}><I.Library size={14}/> 存素材库</Btn>
           <Btn onClick={downloadPackage}><I.Download size={14}/> 下载素材包</Btn>
@@ -1246,7 +1390,7 @@ function Feature1() {
           {step===1 && <Step1 onNext={nextFromTopics}/>}
           {step===2 && <Step3 source={source} onNext={(note) => { mergeSource({ note }); adv(3); }}/>}
           {step===3 && <Step4 source={source} onNext={(imageData) => { mergeSource(imageData); adv(4); }}/>}
-          {step===4 && <Step2 source={source} onNext={() => adv(5)}/>}
+          {step===4 && <Step2 source={source} onNext={(validation) => { mergeSource(validation); adv(5); }}/>}
           {step===5 && <Step5 source={source}/>}
         </div>
       </div>
