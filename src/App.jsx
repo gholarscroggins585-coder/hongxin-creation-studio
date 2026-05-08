@@ -1,11 +1,12 @@
 import { useState, useEffect, useRef, useCallback, createContext, useContext } from "react";
+import { parseFile, fetchUrlContent, isSupportedFile } from "./parsers.js";
 
 /* ═══════════════ AI Config Context ═══════════════ */
 const ApiConfigContext = createContext(null);
 
 const MODEL_REGISTRY = [
   { id:"anthropic", name:"Claude (Anthropic)", logo:"C", color:"oklch(0.62 0.15 30)", endpoint:"https://api.anthropic.com/v1/messages", models:["claude-sonnet-4-20250514","claude-haiku-4-5-20251001"], headerKey:"x-api-key", extraHeaders:{"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"} },
-  { id:"openai", name:"OpenAI", logo:"GPT", color:"oklch(0.55 0.13 165)", endpoint:"https://api.openai.com/v1/chat/completions", models:["gpt-4o","gpt-4o-mini","gpt-image-2"], headerKey:"Authorization", authPrefix:"Bearer " },
+  { id:"openai", name:"OpenAI", logo:"GPT", color:"oklch(0.55 0.13 165)", endpoint:"https://api.openai.com/v1/chat/completions", models:["gpt-4o","gpt-4o-mini","gpt-image-1","gpt-image-1.5"], headerKey:"Authorization", authPrefix:"Bearer " },
   { id:"doubao", name:"豆包 (ByteDance)", logo:"豆", color:"oklch(0.7 0.16 230)", endpoint:"https://ark.cn-beijing.volces.com/api/v3/chat/completions", models:["doubao-pro-32k","doubao-lite-32k"], headerKey:"Authorization", authPrefix:"Bearer " },
   { id:"qwen", name:"通义千问 (Alibaba)", logo:"Q", color:"oklch(0.65 0.18 290)", endpoint:"https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", models:["qwen-max","qwen-plus","qwen-turbo"], headerKey:"Authorization", authPrefix:"Bearer " },
   { id:"deepseek", name:"DeepSeek", logo:"DS", color:"oklch(0.6 0.14 230)", endpoint:"https://api.deepseek.com/v1/chat/completions", models:["deepseek-chat","deepseek-reasoner"], headerKey:"Authorization", authPrefix:"Bearer " },
@@ -17,7 +18,7 @@ const SCENE_ROUTES_DEFAULT = [
   { scene:"选题挖掘", primary:"anthropic", model:"claude-sonnet-4-20250514", fallback:"openai" },
   { scene:"Agent验证", primary:"anthropic", model:"claude-sonnet-4-20250514", fallback:"openai" },
   { scene:"笔记文案", primary:"anthropic", model:"claude-sonnet-4-20250514", fallback:"openai" },
-  { scene:"图片生成", type:"image", primary:"openai", model:"gpt-image-2", fallback:"" },
+  { scene:"图片生成", type:"image", primary:"openai", model:"gpt-image-1.5", fallback:"" },
   { scene:"投流文案", primary:"anthropic", model:"claude-sonnet-4-20250514", fallback:"qwen" },
   { scene:"合规检测", primary:"anthropic", model:"claude-sonnet-4-20250514", fallback:"qwen" },
 ];
@@ -31,6 +32,7 @@ function useApiConfig() {
   const [keys, setKeys] = useState({});
   const [routes, setRoutes] = useState(SCENE_ROUTES_DEFAULT);
   const [loaded, setLoaded] = useState(false);
+  const [backendHealth, setBackendHealth] = useState(null);
 
   useEffect(() => {
     (async () => {
@@ -39,6 +41,24 @@ function useApiConfig() {
         if (raw) { const d = JSON.parse(raw); setKeys(d.keys||{}); setRoutes(normalizeRoutes(d.routes)); }
       } catch(e) { console.log("No stored config yet"); }
       setLoaded(true);
+    })();
+  }, []);
+
+  useEffect(() => {
+    const backend = getBackendBase();
+    if (!backend) { setBackendHealth(null); return; }
+    (async () => {
+      try {
+        const headers = {};
+        const t = getBackendToken();
+        if (t) headers["X-Access-Token"] = t;
+        const res = await fetch(`${backend}/health`, { headers });
+        if (!res.ok) { setBackendHealth({ ok: false, error: `HTTP ${res.status}` }); return; }
+        const data = await res.json();
+        setBackendHealth({ ok: true, providers: data.providers || [], accessTokenRequired: !!data.accessTokenRequired });
+      } catch (e) {
+        setBackendHealth({ ok: false, error: e.message?.slice(0, 80) });
+      }
     })();
   }, []);
 
@@ -53,81 +73,183 @@ function useApiConfig() {
   };
 
   const getStatus = (providerId) => {
+    if (backendHealth?.ok && backendHealth.providers?.includes(providerId)) return "已连接";
     const k = keys[providerId];
     if (!k || !k.key) return "未配置";
     if (k.verified) return "已连接";
     return "待验证";
   };
 
-  return { keys, routes, loaded, saveKeys, saveRoutes, getStatus };
+  return { keys, routes, loaded, saveKeys, saveRoutes, getStatus, backendHealth };
+}
+
+function getBackendBase() {
+  const v = (import.meta.env?.VITE_BACKEND_URL || "").trim();
+  return v ? v.replace(/\/$/, "") : "";
+}
+function getBackendToken() {
+  return (import.meta.env?.VITE_BACKEND_TOKEN || "").trim();
+}
+function isBackendMode() { return !!getBackendBase(); }
+
+function resolveEndpoint(defaultEndpoint, customBase, providerId) {
+  // Backend (托管模式) wins over per-provider customBase wins over default.
+  const backend = getBackendBase();
+  if (backend && providerId) {
+    try {
+      const u = new URL(defaultEndpoint);
+      return `${backend}/${providerId}${u.pathname}`;
+    } catch { /* fall through */ }
+  }
+  if (!customBase || !customBase.trim()) return defaultEndpoint;
+  try {
+    const u = new URL(defaultEndpoint);
+    return customBase.trim().replace(/\/$/, "") + u.pathname;
+  } catch { return defaultEndpoint; }
 }
 
 async function callAI({ keys, routes, scene, prompt, systemPrompt, maxTokens=1000 }) {
   const route = routes?.find(r => r.scene === scene) || routes?.[0];
-  const providerId = keys?.[route?.primary]?.key ? route?.primary : (keys?.[route?.fallback]?.key ? route?.fallback : route?.primary || "anthropic");
+  const backend = getBackendBase();
+  const providerId = backend
+    ? (route?.primary || "anthropic")
+    : (keys?.[route?.primary]?.key ? route?.primary : (keys?.[route?.fallback]?.key ? route?.fallback : route?.primary || "anthropic"));
   const provider = MODEL_REGISTRY.find(p => p.id === providerId);
   const apiKey = keys?.[providerId]?.key;
+  const endpoint = resolveEndpoint(provider?.endpoint, keys?.[providerId]?.baseUrl, providerId);
 
-  if (!provider || !apiKey) {
-    throw new Error(`未配置 ${provider?.name || providerId} 的 API Key，请到设置中心配置`);
+  if (!provider) throw new Error(`未知厂商：${providerId}`);
+  if (!backend && !apiKey) {
+    throw new Error(`未配置 ${provider.name} 的 API Key，请到设置中心配置`);
   }
 
-  const model = providerId === route?.primary ? (route?.model || provider.models[0]) : provider.models[0];
+  const model = (providerId === route?.primary || backend) ? (route?.model || provider.models[0]) : provider.models[0];
+  const accessToken = getBackendToken();
 
   if (providerId === "anthropic") {
-    const res = await fetch(provider.endpoint, {
+    const headers = { "Content-Type": "application/json" };
+    if (backend) {
+      if (accessToken) headers["X-Access-Token"] = accessToken;
+    } else {
+      headers[provider.headerKey] = apiKey;
+      Object.assign(headers, provider.extraHeaders || {});
+    }
+    const res = await fetch(endpoint, {
       method: "POST",
-      headers: { "Content-Type": "application/json", [provider.headerKey]: apiKey, ...provider.extraHeaders },
+      headers,
       body: JSON.stringify({ model, max_tokens: maxTokens, ...(systemPrompt ? { system: systemPrompt } : {}), messages: [{ role: "user", content: prompt }] })
     });
-    if (!res.ok) { const e = await res.text(); throw new Error(`Anthropic API 错误 (${res.status}): ${e}`); }
+    if (!res.ok) { const e = await res.text(); throw new Error(`Anthropic API 错误 (${res.status}): ${e.slice(0,200)}`); }
     const data = await res.json();
     return data.content?.map(c => c.text || "").join("") || "";
   } else {
-    // OpenAI-compatible format (OpenAI, 豆包, 通义, DeepSeek, 智谱)
     const msgs = [];
     if (systemPrompt) msgs.push({ role: "system", content: systemPrompt });
     msgs.push({ role: "user", content: prompt });
     const headers = { "Content-Type": "application/json" };
-    headers[provider.headerKey] = (provider.authPrefix || "") + apiKey;
-
-    const res = await fetch(provider.endpoint, {
+    if (backend) {
+      if (accessToken) headers["X-Access-Token"] = accessToken;
+    } else {
+      headers[provider.headerKey] = (provider.authPrefix || "") + apiKey;
+    }
+    const res = await fetch(endpoint, {
       method: "POST",
       headers,
       body: JSON.stringify({ model, max_tokens: maxTokens, messages: msgs })
     });
-    if (!res.ok) { const e = await res.text(); throw new Error(`${provider.name} API 错误 (${res.status}): ${e}`); }
+    if (!res.ok) { const e = await res.text(); throw new Error(`${provider.name} API 错误 (${res.status}): ${e.slice(0,200)}`); }
     const data = await res.json();
     return data.choices?.[0]?.message?.content || "";
   }
 }
 
-async function testApiKey(providerId, apiKey) {
+async function testApiKey(providerId, apiKey, baseUrl) {
   const provider = MODEL_REGISTRY.find(p => p.id === providerId);
   if (!provider) throw new Error("Unknown provider");
-  const testKeys = { [providerId]: { key: apiKey } };
-  const testRoutes = [{ scene: "test", primary: providerId, model: provider.models[provider.models.length - 1] }];
+  const testKeys = { [providerId]: { key: apiKey, baseUrl } };
+  const textModel = provider.models.find(m => !m.includes("image")) || provider.models[0];
+  const testRoutes = [{ scene: "test", primary: providerId, model: textModel }];
   return await callAI({ keys: testKeys, routes: testRoutes, scene: "test", prompt: "Say OK", maxTokens: 10 });
 }
 
-async function callImageGen({ keys, routes, prompt, model, size="768x1024", quality="low", n=1 }) {
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function resolveImageRoute(keys, routes) {
   const route = routes?.find(r => r.scene === "图片生成") || SCENE_ROUTES_DEFAULT.find(r => r.scene === "图片生成");
-  const providerId = keys?.[route?.primary]?.key ? route.primary : (keys?.[route?.fallback]?.key ? route.fallback : route?.primary || "openai");
+  const backend = getBackendBase();
+  const providerId = backend
+    ? (route?.primary || "openai")
+    : (keys?.[route?.primary]?.key ? route.primary : (keys?.[route?.fallback]?.key ? route.fallback : route?.primary || "openai"));
   const provider = MODEL_REGISTRY.find(p => p.id === providerId);
   const apiKey = keys?.[providerId]?.key;
+  return { route, providerId, provider, apiKey };
+}
 
-  if (providerId !== "openai") throw new Error("当前图片生成接口仅支持 OpenAI，请在场景路由中将「图片生成」设为 OpenAI / gpt-image-2");
-  if (!apiKey) throw new Error("未配置 OpenAI API Key，请到设置中心配置后使用图片生成");
-  const imageModel = model || route?.model || provider?.models?.find(m => m.includes("image")) || "gpt-image-2";
+const OPENAI_IMAGE_GEN = "https://api.openai.com/v1/images/generations";
+const OPENAI_IMAGE_EDIT = "https://api.openai.com/v1/images/edits";
 
-  const res = await fetch("https://api.openai.com/v1/images/generations", {
+function buildImageHeaders(apiKey) {
+  const backend = getBackendBase();
+  const headers = { "Content-Type": "application/json" };
+  if (backend) {
+    const t = getBackendToken();
+    if (t) headers["X-Access-Token"] = t;
+  } else {
+    headers["Authorization"] = "Bearer " + apiKey;
+  }
+  return headers;
+}
+
+async function callImageGen({ keys, routes, prompt, model, size="768x1024", quality="low", n=1 }) {
+  const { route, providerId, provider, apiKey } = resolveImageRoute(keys, routes);
+  const backend = getBackendBase();
+
+  if (providerId !== "openai") throw new Error("当前图片生成接口仅支持 OpenAI，请在场景路由中将「图片生成」设为 OpenAI / gpt-image-1.5");
+  if (!backend && !apiKey) throw new Error("未配置 OpenAI API Key，请到设置中心配置后使用图片生成");
+  const imageModel = model || route?.model || provider?.models?.find(m => m.includes("image")) || "gpt-image-1.5";
+  const endpoint = resolveEndpoint(OPENAI_IMAGE_GEN, keys?.openai?.baseUrl, "openai");
+
+  const res = await fetch(endpoint, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + apiKey },
+    headers: buildImageHeaders(apiKey),
     body: JSON.stringify({ model: imageModel, prompt, size, quality, n, output_format: "png" })
   });
   if (!res.ok) { const e = await res.text(); throw new Error(`OpenAI Image API 错误 (${res.status}): ${e.slice(0,200)}`); }
   const data = await res.json();
-  // Returns array of { b64_json } or { url }
+  return (data.data || []).map(img => img.b64_json ? `data:image/png;base64,${img.b64_json}` : img.url);
+}
+
+async function callImageEdit({ keys, routes, prompt, images, model, size="768x1024", quality="low", inputFidelity="high" }) {
+  const { route, providerId, provider, apiKey } = resolveImageRoute(keys, routes);
+  const backend = getBackendBase();
+
+  if (providerId !== "openai") throw new Error("当前图片编辑接口仅支持 OpenAI，请在场景路由中将「图片生成」设为 OpenAI / gpt-image-1.5");
+  if (!backend && !apiKey) throw new Error("未配置 OpenAI API Key，请到设置中心配置后使用图片编辑");
+  const imageModel = model || route?.model || provider?.models?.find(m => m.includes("image")) || "gpt-image-1.5";
+  const endpoint = resolveEndpoint(OPENAI_IMAGE_EDIT, keys?.openai?.baseUrl, "openai");
+
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: buildImageHeaders(apiKey),
+    body: JSON.stringify({
+      model: imageModel,
+      prompt,
+      images: images.map(image_url => ({ image_url })),
+      size,
+      quality,
+      input_fidelity: inputFidelity,
+      output_format: "png"
+    })
+  });
+  if (!res.ok) { const e = await res.text(); throw new Error(`OpenAI Image Edit API 错误 (${res.status}): ${e.slice(0,200)}`); }
+  const data = await res.json();
   return (data.data || []).map(img => img.b64_json ? `data:image/png;base64,${img.b64_json}` : img.url);
 }
 
@@ -215,7 +337,6 @@ function Sidebar({ page, setPage }) {
       { id:"dash", label:"工作台", icon:<I.Home size={16}/> },
       { id:"feature1", label:"素人爆文生成", icon:<I.Spark size={16}/>, badge:"1" },
       { id:"feature3", label:"聚光投流素材", icon:<I.Megaphone size={16}/> },
-      { id:"approval", label:"审批流", icon:<I.Check size={16}/>, badge:"2" },
       { id:"knowledge", label:"行业知识库", icon:<I.Doc size={16}/> },
     ]},
     { group:"数据", entries:[
@@ -267,7 +388,7 @@ function Sidebar({ page, setPage }) {
 /* ═══════════════ TopBar ═══════════════ */
 const CRUMBS = {
   dash:["工作区","工作台"], feature1:["素人笔记","爆文批量生成"], feature3:["商业化","聚光投流素材"],
-  approval:["协作","审批流"], knowledge:["工作区","行业知识库"], accounts:["数据","账号矩阵"],
+  knowledge:["工作区","行业知识库"], accounts:["数据","账号矩阵"],
   track:["数据","赛道分析"], reviewcenter:["数据","数据复盘"], library:["资源","笔记内容库"],
   materials:["资源","素材库"], settings:["资源","设置"],
 };
@@ -385,18 +506,66 @@ function PhonePreview({ title, body, end }) {
 
 /* ═══════════════ Dashboard ═══════════════ */
 function Dashboard({ goto }) {
+  const [dashData, setDashData] = useState({ notes: [], reviewNotes: [], materials: [], accounts: [], knowledge: [] });
+
+  useEffect(() => {
+    const read = (key) => {
+      try {
+        const raw = localStorage.getItem(key);
+        return raw ? JSON.parse(raw) : [];
+      } catch {
+        return [];
+      }
+    };
+    setDashData({
+      notes: read("note-library"),
+      reviewNotes: read("review-notes"),
+      materials: read("material-pool"),
+      accounts: read("acc-matrix"),
+      knowledge: read("kb-items"),
+    });
+  }, []);
+
+  const totalNotes = dashData.notes.length;
+  const publishedNotes = dashData.notes.filter(n => n.status === "已发布").length;
+  const hotNotes = dashData.reviewNotes.filter(n => n.score >= 70).length;
+  const hotRate = totalNotes > 0 ? ((hotNotes / totalNotes) * 100).toFixed(1) : "0.0";
+  const totalReads = dashData.reviewNotes.reduce((sum, n) => sum + (Number(n.reads) || 0), 0);
+  const roiValue = dashData.materials.length > 0 ? `${(1 + dashData.materials.length * 0.18).toFixed(2)}x` : "待录入";
   const stats = [
-    { label:"本月生成笔记", value:"248", delta:"+32%", up:true, sub:"vs. 上月 · 188 篇" },
-    { label:"爆文率", value:"23.4%", delta:"+5.1pt", up:true, sub:"阅读≥1w / 总数" },
-    { label:"节省人力", value:"186h", delta:"≈ 23 个工作日", up:true, sub:"本月对比手工产出" },
-    { label:"投流ROI", value:"3.82x", delta:"-0.4x", up:false, sub:"近 7 天聚光投放" },
+    { label:"累计笔记", value:String(totalNotes || 0), delta:`已发布 ${publishedNotes}`, up:true, sub: totalNotes > 0 ? "来自笔记内容库" : "先去生成或新建笔记" },
+    { label:"爆文率", value:`${hotRate}%`, delta:`爆文 ${hotNotes}`, up: hotNotes > 0, sub: dashData.reviewNotes.length > 0 ? "基于数据复盘记录" : "录入复盘数据后自动计算" },
+    { label:"素材储备", value:String(dashData.materials.length || 0), delta:`知识 ${dashData.knowledge.length}`, up:true, sub: `账号 ${dashData.accounts.length} · 阅读 ${totalReads || 0}` },
+    { label:"投流ROI", value:roiValue, delta:dashData.materials.length > 0 ? "按素材储备预估" : "暂无估算", up:dashData.materials.length > 0, sub:"接入真实投放数据后可替换" },
   ];
+
+  const recentItems = dashData.notes.length > 0
+    ? dashData.notes.slice(0, 4).map((n, i) => ({
+        id: `N-${i + 1}`,
+        name: n.title,
+        count: (n.tags || []).length || 1,
+        status: n.status === "已发布" ? "done" : n.status === "待审核" ? "running" : "draft",
+        progress: n.status === "已发布" ? 1 : n.status === "待审核" ? 0.72 : 0.35,
+        agent: n.status || "草稿",
+        time: n.addedAt ? new Date(n.addedAt).toLocaleDateString() : "刚刚",
+      }))
+    : TASKS;
+
+  const topicRadar = dashData.knowledge.length > 0
+    ? dashData.knowledge.slice(0, 5).map((item, i) => ({
+        tag: item.cat || "知识库",
+        title: item.title,
+        reads: item.tokens || "--",
+        hot: ["S+", "S", "A+", "A", "A"][i] || "A",
+      }))
+    : TOPICS.slice(0, 5);
+
   return (
     <div style={S.page}>
       <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:18 }}>
         <div>
           <h1 style={S.pageH1}>下午好，李小红 👋</h1>
-          <p style={S.pageSub}>今天有 3 个生成任务在跑，2 篇笔记进入了爆文池。</p>
+          <p style={S.pageSub}>当前累计 {totalNotes} 篇笔记、{dashData.materials.length} 份素材、{dashData.knowledge.length} 条知识，工作台已开始读取真实本地数据。</p>
         </div>
         <div style={{ display:"flex", gap:8 }}>
           <Btn><I.Calendar size={14}/> 本周</Btn>
@@ -433,7 +602,7 @@ function Dashboard({ goto }) {
             <Btn sm>查看全部</Btn>
           </div>
           <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
-            {TASKS.map(t => (
+            {recentItems.map(t => (
               <div key={t.id} style={{ display:"grid", gridTemplateColumns:"auto 1fr auto", gap:12, padding:"12px 14px", borderRadius:12, border:"1px solid var(--line)", alignItems:"center" }}>
                 <div style={{ width:36, height:36, borderRadius:10, background: t.status==="done" ? "var(--mintSoft)" : t.status==="running" ? "var(--brandSoft)" : "var(--surface3)",
                   color: t.status==="done" ? "var(--mintDeep)" : t.status==="running" ? "var(--brandDeep)" : "var(--ink3)", display:"grid", placeItems:"center" }}>
@@ -464,7 +633,7 @@ function Dashboard({ goto }) {
             <div><div style={S.cardTitle}>今日热门选题雷达</div><div style={S.cardSub}>基于近 24h 小红书搜索 + 互动趋势</div></div>
           </div>
           <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
-            {TOPICS.slice(0,5).map((t,i) => (
+            {topicRadar.map((t,i) => (
               <div key={i} style={{ display:"grid", gridTemplateColumns:"26px 1fr auto auto", gap:10, alignItems:"center", padding:"8px 4px", borderBottom: i===4 ? "none" : "1px dashed var(--line)", cursor:"pointer", borderRadius:6 }}>
                 <span style={{ fontFamily:"var(--mono)", color:"var(--ink4)", fontSize:12, fontWeight:700 }}>0{i+1}</span>
                 <div>
@@ -504,7 +673,7 @@ function Step1({ onNext }) {
   const [topics, setTopics] = useState(TOPICS);
   const [aiError, setAiError] = useState(null);
 
-  const hasAI = Object.values(keys).some(k => k?.key);
+  const hasAI = isBackendMode() || Object.values(keys).some(k => k?.key);
 
   const regen = async () => {
     setGen(true); setAiError(null);
@@ -686,7 +855,7 @@ function Step3({ onNext, source }) {
   const [generated, setGenerated] = useState([makeInputDrivenNote(source), makeInputDrivenNote(source), makeInputDrivenNote(source)]);
   const [loading, setLoading] = useState(false);
   const [aiError, setAiError] = useState(null);
-  const hasAI = Object.values(keys).some(k => k?.key);
+  const hasAI = isBackendMode() || Object.values(keys).some(k => k?.key);
   const vs = [
     { hook:"新手妈妈别再硬扛了！夜醒3次以上的你们这条一定要看",
       painOpen:"姐妹们我真的崩溃过——月子里每天只睡2小时，婆婆说「忍忍就过去了」，但根本不是忍的事。后来我摸索出一套方法，从夜醒5次到一觉到天亮，今天全分享给你们👇",
@@ -790,7 +959,7 @@ function Step3({ onNext, source }) {
       {aiError && <div style={{ padding:"8px 14px", borderRadius:8, background:"oklch(0.96 0.04 25)", color:"var(--brandDeep)", fontSize:12, marginBottom:8 }}>⚠ {aiError}</div>}
       <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
         <span style={{ fontSize:12, color:"var(--ink3)" }}>版本 {v+1} · 约{wordCount}字 · 痛点→分点方案→经验→建议→标签</span>
-        <Btn primary style={{ padding:"11px 18px" }} onClick={onNext}>下一步：批量出图 <I.Arrow size={14}/></Btn>
+        <Btn primary style={{ padding:"11px 18px" }} onClick={() => onNext(cur)}>下一步：批量出图 <I.Arrow size={14}/></Btn>
       </div>
     </div>
   );
@@ -817,12 +986,14 @@ function Step4({ onNext, source }) {
   });
   const [done, setDone] = useState(Array(6).fill(false));
   const [images, setImages] = useState(Array(6).fill(null));
+  const [editPrompts, setEditPrompts] = useState(inputPrompts);
+  const [referenceImages, setReferenceImages] = useState(Array(6).fill(null));
   const [genning, setGenning] = useState(false);
   const [aiError, setAiError] = useState(null);
 
   const imageRoute = routes?.find(r => r.scene === "图片生成") || SCENE_ROUTES_DEFAULT.find(r => r.scene === "图片生成");
   const imageProvider = MODEL_REGISTRY.find(p => p.id === imageRoute?.primary);
-  const hasImageAI = imageRoute?.primary === "openai" && !!keys?.openai?.key;
+  const hasImageAI = imageRoute?.primary === "openai" && (isBackendMode() || !!keys?.openai?.key);
 
   const genSingle = async (idx) => {
     if (!hasImageAI) {
@@ -832,7 +1003,10 @@ function Step4({ onNext, source }) {
       return;
     }
     try {
-      const urls = await callImageGen({ keys, routes, prompt: inputPrompts[idx] || prompts[idx], size: "768x1024", quality: "low", n: 1 });
+      const sourceImages = [referenceImages[idx], images[idx]].filter(Boolean);
+      const urls = sourceImages.length > 0
+        ? await callImageEdit({ keys, routes, prompt: editPrompts[idx] || inputPrompts[idx] || prompts[idx], images: sourceImages, size: "768x1024", quality: "low" })
+        : await callImageGen({ keys, routes, prompt: editPrompts[idx] || inputPrompts[idx] || prompts[idx], size: "768x1024", quality: "low", n: 1 });
       setImages(imgs => { const n=[...imgs]; n[idx] = urls[0] || null; return n; });
       setDone(d => { const n=[...d]; n[idx]=true; return n; });
     } catch(e) {
@@ -855,6 +1029,16 @@ function Step4({ onNext, source }) {
     await genSingle(idx);
   };
 
+  const uploadReference = async (idx, file) => {
+    if (!file) return;
+    try {
+      const dataUrl = await readFileAsDataUrl(file);
+      setReferenceImages(imgs => { const next = [...imgs]; next[idx] = dataUrl; return next; });
+    } catch (e) {
+      setAiError(e.message?.slice(0, 120) || "参考图读取失败");
+    }
+  };
+
   useEffect(() => { gen(); }, []);
   return (
     <div>
@@ -875,7 +1059,7 @@ function Step4({ onNext, source }) {
         <div style={S.cardH}><div style={S.cardTitle}>配图九宫格</div></div>
         <div style={{ display:"grid", gridTemplateColumns:"repeat(3, 1fr)", gap:12 }}>
           {variants.map((vr,i) => (
-            <div key={i} style={{ borderRadius:12, overflow:"hidden", border:"1px solid var(--line)" }}>
+            <div key={i} style={{ borderRadius:12, overflow:"hidden", border:"1px solid var(--line)", background:"var(--surface)" }}>
               <div style={{ position:"relative" }}>
                 {images[i] ? (
                   <img src={images[i]} alt={labels[i]} style={{ width:"100%", aspectRatio:"3/4", objectFit:"cover", display:"block" }}/>
@@ -893,12 +1077,22 @@ function Step4({ onNext, source }) {
                   {images[i] && <a href={images[i]} download={`img_${i+1}.png`} style={{...S.iconBtn, width:26, height:26, background:"white", boxShadow:"var(--shadow1)", display:"grid", placeItems:"center", textDecoration:"none", color:"inherit"}}><I.Download size={12}/></a>}
                 </div>}
               </div>
+              <div style={{padding:10, borderTop:"1px solid var(--line)", display:"flex", flexDirection:"column", gap:8}}>
+                <textarea style={{...S.input, minHeight:82, fontSize:11, lineHeight:1.5, resize:"vertical"}} value={editPrompts[i] || ""} onChange={e => setEditPrompts(list => { const next = [...list]; next[i] = e.target.value; return next; })} />
+                <div style={{display:"flex", gap:8, alignItems:"center", justifyContent:"space-between"}}>
+                  <label style={{fontSize:11, color:"var(--ink3)", cursor:"pointer"}}>
+                    <input type="file" accept="image/*" style={{display:"none"}} onChange={e => uploadReference(i, e.target.files?.[0])}/>
+                    {referenceImages[i] ? "已上传参考图" : "上传参考图"}
+                  </label>
+                  <Btn sm primary onClick={() => regenSingle(i)} disabled={!hasImageAI && !referenceImages[i] && !images[i]}><I.Magic size={11}/> 单张重绘</Btn>
+                </div>
+              </div>
             </div>
           ))}
         </div>
       </Card>
       <div style={{ display:"flex", justifyContent:"flex-end", marginTop:18 }}>
-        <Btn primary style={{ padding:"11px 18px" }} disabled={!done.every(d=>d)} onClick={onNext}>下一步：审阅导出 <I.Arrow size={14}/></Btn>
+        <Btn primary style={{ padding:"11px 18px" }} disabled={!done.every(d=>d)} onClick={() => onNext({ images, imagePrompts: editPrompts })}>下一步：审阅导出 <I.Arrow size={14}/></Btn>
       </div>
     </div>
   );
@@ -906,6 +1100,79 @@ function Step4({ onNext, source }) {
 
 function Step5({ source }) {
   const topicTitle = source?.topics?.[0]?.title || source?.keyword || "手动选题";
+  const note = source?.note || makeInputDrivenNote(source);
+  const images = source?.images || [];
+  const imagePrompts = source?.imagePrompts || [];
+  const [saveStatus, setSaveStatus] = useState(null);
+  const noteContent = [
+    note.painOpen,
+    ...(note.points || []),
+    note.personalExp,
+    note.suggestion,
+    note.end,
+    "",
+    ...(note.tags || []),
+  ].filter(Boolean).join("\n\n");
+
+  const readStore = (key) => {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw ? JSON.parse(raw) : [];
+    } catch {
+      return [];
+    }
+  };
+
+  const saveToLibrary = (status = "草稿") => {
+    const notes = readStore("note-library");
+    const nextNote = {
+      id: Date.now(),
+      title: note.hook || topicTitle,
+      content: noteContent,
+      tags: note.tags || [],
+      status,
+      account: "",
+      addedAt: new Date().toISOString(),
+      wordCount: noteContent.length,
+      source: "素人爆文生成",
+    };
+    localStorage.setItem("note-library", JSON.stringify([nextNote, ...notes]));
+    setSaveStatus(status === "待审核" ? "已保存到内容库，并进入待审核状态。" : "已保存到笔记内容库。");
+  };
+
+  const saveToMaterials = () => {
+    const materials = readStore("material-pool");
+    const promptPack = {
+      id: Date.now(),
+      type: "🤖Prompt",
+      title: `${topicTitle} · 配图 Prompt 包`,
+      content: imagePrompts.join("\n\n---\n\n"),
+      tags: ["配图", "Prompt", source?.category || "小红书"],
+      addedAt: new Date().toISOString(),
+      used: 0,
+    };
+    localStorage.setItem("material-pool", JSON.stringify([promptPack, ...materials]));
+    setSaveStatus("配图 Prompt 已保存到素材库。");
+  };
+
+  const downloadPackage = () => {
+    const payload = {
+      topic: topicTitle,
+      note,
+      imagePrompts,
+      imageCount: images.filter(Boolean).length,
+      exportedAt: new Date().toISOString(),
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${topicTitle.replace(/[\\/:*?"<>|]/g, "_")}_素材包.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    setSaveStatus("素材包 JSON 已开始下载。");
+  };
+
   return (
     <div>
       <Card style={{ background:"linear-gradient(95deg, oklch(0.95 0.04 165), oklch(0.99 0.005 80))", borderColor:"transparent" }}>
@@ -913,19 +1180,28 @@ function Step5({ source }) {
           <div style={{ width:48, height:48, borderRadius:14, background:"var(--mint)", color:"white", display:"grid", placeItems:"center", flex:"0 0 48px" }}><I.Check size={24}/></div>
           <div style={{ flex:1 }}>
             <div style={{ fontSize:16, fontWeight:700 }}>笔记已生成完成 🎉</div>
-            <div style={{ fontSize:13, color:"var(--ink2)" }}>共 1 篇笔记 · 6 张图 · 约820字 · 综合得分 89 · 痛点→方案→经验→标签</div>
+            <div style={{ fontSize:13, color:"var(--ink2)" }}>共 1 篇笔记 · {images.filter(Boolean).length || 6} 张图 · 约{noteContent.length}字 · 综合得分 89 · 痛点→方案→经验→标签</div>
           </div>
-          <Btn><I.Download size={14}/> 下载素材包</Btn>
-          <Btn primary><I.Send size={14}/> 一键发布</Btn>
+          <Btn onClick={saveToMaterials}><I.Library size={14}/> 存素材库</Btn>
+          <Btn onClick={downloadPackage}><I.Download size={14}/> 下载素材包</Btn>
+          <Btn primary onClick={() => saveToLibrary("待审核")}><I.Send size={14}/> 加入待审核</Btn>
         </div>
       </Card>
+      {saveStatus && <div style={{ marginTop:10, padding:"8px 14px", borderRadius:8, background:"var(--mintSoft)", color:"var(--mintDeep)", fontSize:12, fontWeight:600 }}>✓ {saveStatus}</div>}
       <div style={{ marginTop:14, marginBottom:14, padding:"10px 14px", borderRadius:10, background:"var(--brandTint)", color:"var(--brandDeep)", fontSize:12, fontWeight:600 }}>本次素材主题：{topicTitle}</div>
       <div style={{ display:"grid", gridTemplateColumns:"1.4fr 1fr", gap:14, marginTop:14 }}>
         <Card>
           <div style={S.cardTitle}>预览 & 编辑</div>
-          <PhonePreview title="新手妈妈别再硬扛了！夜醒3次以上的你们这条一定要看" body={["姐妹们我真的崩溃过——月子里每天只睡2小时…","1️⃣ 白天小睡别超过3.5小时","2️⃣ 睡前建立固定流程","3️⃣ 卧室温度控制在22-24度","4️⃣ 拒绝奶睡用安抚巾替代","5️⃣ 记录睡眠日记找规律","💬 我是在娃4个月时开始调整的…","💡 建议先从第1和第3点开始…"]} end={"你家娃现在几个月？评论告诉我～\n\n#新手妈妈 #宝宝夜醒 #育儿干货 #婴儿睡眠 #哄睡技巧"}/>
+          <PhonePreview title={note.hook} body={[note.painOpen?.slice(0,70)+"…",...(note.points || []).map(p=>p.split("\n")[0]),"💬 "+(note.personalExp || "").slice(0,44)+"…","💡 "+(note.suggestion || "").slice(0,44)+"…"]} end={`${note.end}\n\n${(note.tags || []).join(" ")}`}/>
         </Card>
         <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
+          <Card>
+            <div style={S.cardTitle}>落库操作</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginTop:10}}>
+              <Btn style={{justifyContent:"center"}} onClick={() => saveToLibrary("草稿")}><I.Doc size={14}/> 存草稿</Btn>
+              <Btn primary style={{justifyContent:"center"}} onClick={() => saveToLibrary("待审核")}><I.Check size={14}/> 待审核</Btn>
+            </div>
+          </Card>
           <Card>
             <div style={S.cardTitle}>发布到</div>
             {["素人小红 · @素人小红 · 8.2w粉","公考新声 · @gkxs_2024 · 12.4w粉"].map((a,i) => (
@@ -951,6 +1227,7 @@ function Feature1() {
   const [source, setSource] = useState(null);
   const adv = n => { setStep(n); setMax(m=>Math.max(m,n)); };
   const nextFromTopics = data => { setSource(data); adv(2); };
+  const mergeSource = data => setSource(s => ({ ...(s || {}), ...(data || {}) }));
   return (
     <div style={S.page}>
       <div style={{ display:"flex", justifyContent:"space-between", marginBottom:18 }}>
@@ -968,8 +1245,8 @@ function Feature1() {
         <div>
           {step===1 && <Step1 onNext={nextFromTopics}/>}
           {step===2 && <Step2 source={source} onNext={() => adv(3)}/>}
-          {step===3 && <Step3 source={source} onNext={() => adv(4)}/>}
-          {step===4 && <Step4 source={source} onNext={() => adv(5)}/>}
+          {step===3 && <Step3 source={source} onNext={(note) => { mergeSource({ note }); adv(4); }}/>}
+          {step===4 && <Step4 source={source} onNext={(imageData) => { mergeSource(imageData); adv(5); }}/>}
           {step===5 && <Step5 source={source}/>}
         </div>
       </div>
@@ -990,7 +1267,7 @@ function Feature3() {
   const [step, setStep] = useState(1);
   const [max, setMax] = useState(1);
   const adv = n => { setStep(n); setMax(m=>Math.max(m,n)); };
-  const hasAI = Object.values(keys).some(k => k?.key);
+  const hasAI = isBackendMode() || Object.values(keys).some(k => k?.key);
 
   // Lifted state across steps
   const [serviceInfo, setServiceInfo] = useState({ name:"", industry:"母婴 · 早教课程", services:"", highlights:"", advantages:"", price:"", trust:"" });
@@ -1286,10 +1563,12 @@ function F3S3({ serviceInfo, personas, painPoints, adCopies, setAdCopies, onNext
 function F3S4({ serviceInfo, adCopies, onNext, keys, routes }) {
   const imageRoute = routes?.find(r => r.scene === "图片生成") || SCENE_ROUTES_DEFAULT.find(r => r.scene === "图片生成");
   const imageProvider = MODEL_REGISTRY.find(p => p.id === imageRoute?.primary);
-  const hasImageAI = imageRoute?.primary === "openai" && !!keys?.openai?.key;
+  const hasImageAI = imageRoute?.primary === "openai" && (isBackendMode() || !!keys?.openai?.key);
   const copies = adCopies.length > 0 ? adCopies : [{tag:"版本1"},{tag:"版本2"}];
   const treats = ["实拍·大字报","清单·表格风","对比·B/A","信任·数据卡"];
   const [images, setImages] = useState({});
+  const [cellPrompts, setCellPrompts] = useState({});
+  const [referenceImages, setReferenceImages] = useState({});
   const [loading, setLoading] = useState({});
   const [error, setError] = useState(null);
 
@@ -1302,13 +1581,25 @@ function F3S4({ serviceInfo, adCopies, onNext, keys, routes }) {
     try {
       const copy = copies[row] || {};
       const prompt = `${stylePrefix}\n风格：${treats[col]}。\n人群：${copy.tag||""}。\n标题文字：「${copy.title?.slice(0,20)||serviceInfo?.name||""}」`;
-      const urls = await callImageGen({ keys, routes, prompt, size:"768x1024", quality:"low", n:1 });
+      const sourceImages = [referenceImages[key], images[key] && images[key] !== "placeholder" ? images[key] : null].filter(Boolean);
+      const urls = sourceImages.length > 0
+        ? await callImageEdit({ keys, routes, prompt: cellPrompts[key] || prompt, images: sourceImages, size:"768x1024", quality:"low" })
+        : await callImageGen({ keys, routes, prompt: cellPrompts[key] || prompt, size:"768x1024", quality:"low", n:1 });
       setImages(m => ({...m,[key]: urls[0] || "placeholder"}));
     } catch(e) { setError(e.message?.slice(0,100)); setImages(m=>({...m,[key]:"placeholder"})); }
     setLoading(l => ({...l,[key]:false}));
   };
 
   const genAll = async () => { setError(null); for(let r=0;r<Math.min(copies.length,3);r++) for(let c=0;c<4;c++) await genImage(r,c); };
+  const uploadReference = async (key, file) => {
+    if (!file) return;
+    try {
+      const dataUrl = await readFileAsDataUrl(file);
+      setReferenceImages(prev => ({...prev, [key]: dataUrl}));
+    } catch (e) {
+      setError(e.message?.slice(0,100) || "参考图读取失败");
+    }
+  };
 
   return (<div>
     <Card style={{marginBottom:14}}>
@@ -1394,33 +1685,49 @@ function F3S5({ adCopies, compliance, setCompliance, keys, routes, hasAI }) {
 }
 
 /* ═══════════════ Settings ═══════════════ */
+const PROVIDER_LINKS = {
+  anthropic: { console: "https://console.anthropic.com/settings/keys", help: "需开通海外手机号注册并充值；CORS 已默认允许浏览器直连。" },
+  openai: { console: "https://platform.openai.com/api-keys", help: "图片生成必须使用 OpenAI；浏览器直连受 OpenAI CORS 限制，建议挂代理。" },
+  doubao: { console: "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey", help: "火山方舟控制台开通豆包模型后创建 API Key；多数情况下需自建代理转发。" },
+  qwen: { console: "https://bailian.console.aliyun.com/?apiKey=1", help: "阿里云百炼开通通义千问后获取 Key；建议自建代理。" },
+  deepseek: { console: "https://platform.deepseek.com/api_keys", help: "DeepSeek 平台直接申请；浏览器多数会撞 CORS，建议自建代理。" },
+  zhipu: { console: "https://bigmodel.cn/usercenter/proj-mgmt/apikeys", help: "智谱 BigModel 开放平台获取 Key；建议自建代理。" },
+};
+
 function SettingsPage() {
-  const { keys, routes, saveKeys, saveRoutes, getStatus } = useContext(ApiConfigContext);
+  const { keys, routes, saveKeys, saveRoutes, getStatus, backendHealth } = useContext(ApiConfigContext);
+  const backendUrl = getBackendBase();
   const [tab,setTab]=useState("models");
   const [editing,setEditing]=useState(null);
   const [editKey,setEditKey]=useState("");
+  const [editBase,setEditBase]=useState("");
   const [testing,setTesting]=useState(false);
   const [testResult,setTestResult]=useState(null);
   const [showKey,setShowKey]=useState({});
+  const [corsProxy, setCorsProxy] = useState("");
 
-  const startEdit = (id) => { setEditing(id); setEditKey(keys[id]?.key || ""); setTestResult(null); };
-  const cancelEdit = () => { setEditing(null); setEditKey(""); setTestResult(null); };
+  useEffect(() => {
+    try { setCorsProxy(localStorage.getItem("kb-cors-proxy") || ""); } catch {}
+  }, []);
+
+  const startEdit = (id) => { setEditing(id); setEditKey(keys[id]?.key || ""); setEditBase(keys[id]?.baseUrl || ""); setTestResult(null); };
+  const cancelEdit = () => { setEditing(null); setEditKey(""); setEditBase(""); setTestResult(null); };
 
   const handleTest = async (id) => {
     setTesting(true); setTestResult(null);
     try {
-      await testApiKey(id, editKey);
+      await testApiKey(id, editKey, editBase);
       setTestResult({ ok: true, msg: "连接成功！模型返回正常" });
     } catch(e) {
-      setTestResult({ ok: false, msg: e.message?.slice(0, 120) || "连接失败" });
+      setTestResult({ ok: false, msg: e.message?.slice(0, 160) || "连接失败" });
     }
     setTesting(false);
   };
 
   const handleSave = async (id) => {
-    const newKeys = { ...keys, [id]: { key: editKey, verified: testResult?.ok || false, savedAt: new Date().toISOString() } };
+    const newKeys = { ...keys, [id]: { key: editKey, baseUrl: editBase || undefined, verified: testResult?.ok || false, savedAt: new Date().toISOString() } };
     await saveKeys(newKeys);
-    setEditing(null); setEditKey(""); setTestResult(null);
+    setEditing(null); setEditKey(""); setEditBase(""); setTestResult(null);
   };
 
   const handleDelete = async (id) => {
@@ -1431,6 +1738,11 @@ function SettingsPage() {
   const handleRouteChange = async (sceneIdx, field, value) => {
     const newRoutes = routes.map((r,i) => i===sceneIdx ? { ...r, [field]: value } : r);
     await saveRoutes(newRoutes);
+  };
+
+  const saveCorsProxy = (val) => {
+    setCorsProxy(val);
+    try { localStorage.setItem("kb-cors-proxy", val.trim()); } catch {}
   };
 
   const maskKey = (k) => k ? k.slice(0,8) + "•".repeat(Math.max(0,k.length-12)) + k.slice(-4) : "";
@@ -1449,11 +1761,49 @@ function SettingsPage() {
     </div>
 
     <div style={{display:"flex",gap:4,borderBottom:"1px solid var(--line)",marginBottom:16}}>
-      {[{id:"models",label:"模型接入 · API Keys"},{id:"routing",label:"场景路由"}].map(t => <button key={t.id} onClick={()=>setTab(t.id)} style={{padding:"9px 14px",fontSize:13,fontWeight:600,whiteSpace:"nowrap",color:tab===t.id?"var(--ink)":"var(--ink3)",border:"none",background:"transparent",borderBottom:tab===t.id?"2px solid var(--brand)":"2px solid transparent",marginBottom:-1,cursor:"pointer"}}>{t.label}</button>)}
+      {[{id:"models",label:"模型接入 · API Keys"},{id:"routing",label:"场景路由"},{id:"network",label:"网络/代理"}].map(t => <button key={t.id} onClick={()=>setTab(t.id)} style={{padding:"9px 14px",fontSize:13,fontWeight:600,whiteSpace:"nowrap",color:tab===t.id?"var(--ink)":"var(--ink3)",border:"none",background:"transparent",borderBottom:tab===t.id?"2px solid var(--brand)":"2px solid transparent",marginBottom:-1,cursor:"pointer"}}>{t.label}</button>)}
     </div>
 
     {tab==="models" && <div>
-      <div style={S.banner}><div style={S.icoWrap}><I.Shield size={16}/></div><div style={{flex:1}}><div style={{fontWeight:700}}>API Key 安全说明</div><div style={{color:"var(--ink3)",fontSize:12}}>Key 仅保存在你的浏览器本地存储中，不会上传到任何服务器。所有 API 调用直接从浏览器发起。</div></div></div>
+      {backendUrl && backendHealth?.ok && <Card style={{marginBottom:14, background:"linear-gradient(95deg, var(--mintSoft), oklch(0.99 0.005 80))", borderColor:"transparent"}}>
+        <div style={{display:"flex",gap:12,alignItems:"flex-start"}}>
+          <div style={{...S.icoWrap, background:"var(--mint)", flex:"0 0 32px"}}><I.Check size={16}/></div>
+          <div style={{flex:1}}>
+            <div style={{fontWeight:700,fontSize:14,marginBottom:4,color:"var(--mintDeep)"}}>✓ 已接入托管后端 · 开箱即用</div>
+            <div style={{fontSize:12,color:"var(--ink2)",lineHeight:1.7}}>
+              当前站点已连接到管理员配置的 Worker 后端（<code style={{fontFamily:"var(--mono)",background:"var(--surface3)",padding:"0 4px",borderRadius:3}}>{backendUrl}</code>），无需自行配置 API Key 即可使用全部 AI 能力。<br/>
+              已就绪厂商：{(backendHealth.providers || []).map(p => <Chip key={p} variant="mint" style={{fontSize:11,marginRight:6}}>{MODEL_REGISTRY.find(m=>m.id===p)?.name || p}</Chip>)}
+              {(!backendHealth.providers || backendHealth.providers.length === 0) && <span style={{color:"var(--brandDeep)"}}>⚠ 后端未配置任何模型密钥，请联系管理员</span>}
+              <br/><span style={{fontSize:11,color:"var(--ink3)"}}>下方仍可填入个人 Key 覆盖托管后端（仅当前浏览器生效）。</span>
+            </div>
+          </div>
+        </div>
+      </Card>}
+      {backendUrl && backendHealth && !backendHealth.ok && <Card style={{marginBottom:14, background:"oklch(0.96 0.04 25)", borderColor:"transparent"}}>
+        <div style={{display:"flex",gap:12,alignItems:"flex-start"}}>
+          <div style={{...S.icoWrap, background:"var(--brand)", flex:"0 0 32px"}}><I.Help size={16}/></div>
+          <div style={{flex:1}}>
+            <div style={{fontWeight:700,fontSize:14,marginBottom:4,color:"var(--brandDeep)"}}>托管后端不可达</div>
+            <div style={{fontSize:12,color:"var(--ink2)",lineHeight:1.7}}>
+              已配置 VITE_BACKEND_URL = <code style={{fontFamily:"var(--mono)"}}>{backendUrl}</code> 但 /health 检查失败：{backendHealth.error}。请联系管理员，或在下方填入个人 API Key 临时使用。
+            </div>
+          </div>
+        </div>
+      </Card>}
+      {!backendUrl && <Card style={{marginBottom:14, background:"linear-gradient(95deg, var(--brandTint), oklch(0.99 0.005 80))", borderColor:"transparent"}}>
+        <div style={{display:"flex",gap:12,alignItems:"flex-start"}}>
+          <div style={{...S.icoWrap, background:"var(--brand)", flex:"0 0 32px"}}><I.Bolt size={16}/></div>
+          <div style={{flex:1}}>
+            <div style={{fontWeight:700,fontSize:14,marginBottom:4}}>30 秒接入指南</div>
+            <div style={{fontSize:12,color:"var(--ink2)",lineHeight:1.7}}>
+              <b>新手最短路径</b>：① 注册 <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noreferrer" style={{color:"var(--brandDeep)"}}>Anthropic</a> 拿到 Key（文本生成，CORS 已开放）→ ② 注册 <a href="https://platform.openai.com/api-keys" target="_blank" rel="noreferrer" style={{color:"var(--brandDeep)"}}>OpenAI</a>（图片生成必需）→ ③ 在下方对应卡片填入 Key 并测试连接 → 立刻可用。<br/>
+              <b>遇到 CORS 报错？</b>切到「网络/代理」标签部署一个 Cloudflare Worker（已附模板，2 分钟），把 Worker URL 填到对应模型卡的「自定义 BaseURL」即可。<br/>
+              <b>想给团队/客户开箱即用？</b>看 worker/ 目录下的 Cloudflare Worker 后端，部署后用 <code style={{fontFamily:"var(--mono)",background:"var(--surface3)",padding:"0 4px",borderRadius:3}}>VITE_BACKEND_URL</code> 重新构建即可让所有访客零配置使用。
+            </div>
+          </div>
+        </div>
+      </Card>}
+      <div style={S.banner}><div style={S.icoWrap}><I.Shield size={16}/></div><div style={{flex:1}}><div style={{fontWeight:700}}>API Key 安全说明</div><div style={{color:"var(--ink3)",fontSize:12}}>Key 仅保存在你的浏览器本地存储中，不会上传到任何服务器。所有 API 调用直接从浏览器发起或经你自填的代理转发。</div></div></div>
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,marginTop:14}}>
         {MODEL_REGISTRY.map(p => {
           const st = getStatus(p.id);
@@ -1476,17 +1826,25 @@ function SettingsPage() {
               </div>}
             </div>
 
-            {!isEditing && keys[p.id]?.key && <div style={{padding:"8px 16px",background:"var(--surface2)",borderTop:"1px solid var(--line)",fontSize:11,fontFamily:"var(--mono)",color:"var(--ink3)",display:"flex",alignItems:"center",gap:8}}>
-              <span style={{flex:1}}>{showKey[p.id] ? keys[p.id].key : maskKey(keys[p.id].key)}</span>
-              <button onClick={() => setShowKey(s => ({...s, [p.id]: !s[p.id]}))} style={{background:"none",border:"none",color:"var(--ink3)",cursor:"pointer",fontSize:10}}>{showKey[p.id] ? "隐藏" : "显示"}</button>
+            {!isEditing && keys[p.id]?.key && <div style={{padding:"8px 16px",background:"var(--surface2)",borderTop:"1px solid var(--line)",fontSize:11,fontFamily:"var(--mono)",color:"var(--ink3)"}}>
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                <span style={{flex:1}}>{showKey[p.id] ? keys[p.id].key : maskKey(keys[p.id].key)}</span>
+                <button onClick={() => setShowKey(s => ({...s, [p.id]: !s[p.id]}))} style={{background:"none",border:"none",color:"var(--ink3)",cursor:"pointer",fontSize:10}}>{showKey[p.id] ? "隐藏" : "显示"}</button>
+              </div>
+              {keys[p.id]?.baseUrl && <div style={{marginTop:4,fontSize:10,color:"var(--ink4)"}}>代理 BaseURL：{keys[p.id].baseUrl}</div>}
             </div>}
 
             {isEditing && <div style={{padding:16,borderTop:"1px solid var(--line)",background:"var(--brandTint)"}}>
               <div style={{fontSize:12,fontWeight:600,color:"var(--ink2)",marginBottom:6}}>API Key</div>
               <input type="password" style={{...S.input,fontFamily:"var(--mono)",fontSize:12,marginBottom:8}} value={editKey} onChange={e => setEditKey(e.target.value)}
                 placeholder={`输入你的 ${p.name} API Key`}/>
-              <div style={{fontSize:11,color:"var(--ink3)",marginBottom:8}}>
-                可用模型：{p.models.join(" / ")}
+              <div style={{fontSize:12,fontWeight:600,color:"var(--ink2)",marginBottom:6}}>自定义 BaseURL（可选 · 用于代理 / CORS 转发）</div>
+              <input type="text" style={{...S.input,fontFamily:"var(--mono)",fontSize:12,marginBottom:8}} value={editBase} onChange={e => setEditBase(e.target.value)}
+                placeholder={`留空使用官方端点 ${new URL(p.endpoint).origin}`}/>
+              <div style={{fontSize:11,color:"var(--ink3)",marginBottom:8,lineHeight:1.6}}>
+                <div>可用模型：{p.models.join(" / ")}</div>
+                <div>官方接入：<a href={PROVIDER_LINKS[p.id]?.console || "#"} target="_blank" rel="noreferrer" style={{color:"var(--brandDeep)"}}>{PROVIDER_LINKS[p.id]?.console || "—"}</a></div>
+                <div style={{marginTop:2}}>{PROVIDER_LINKS[p.id]?.help}</div>
               </div>
               {testResult && <div style={{padding:"8px 12px",borderRadius:8,marginBottom:8,fontSize:12,fontWeight:600,
                 background:testResult.ok?"var(--mintSoft)":"oklch(0.96 0.04 25)",color:testResult.ok?"var(--mintDeep)":"var(--brandDeep)"}}>
@@ -1536,6 +1894,84 @@ function SettingsPage() {
             </tr>;
           })}</tbody>
         </table>
+      </Card>
+    </div>}
+
+    {tab==="network" && <div>
+      <div style={S.banner}><div style={S.icoWrap}><I.Layers size={16}/></div><div style={{flex:1}}><div style={{fontWeight:700}}>网络与代理</div><div style={{color:"var(--ink3)",fontSize:12}}>解决浏览器直连大模型的 CORS 问题，以及知识库 URL 抓取的代理设置。</div></div></div>
+
+      <Card style={{marginTop:14}}>
+        <div style={S.cardH}><div><div style={S.cardTitle}>知识库 · 网页抓取代理</div><div style={S.cardSub}>留空则按顺序尝试 corsproxy.io / allorigins.win 公共代理；填了自己的代理会优先使用。</div></div></div>
+        <input type="text" style={{...S.input,fontFamily:"var(--mono)",fontSize:12,marginBottom:8}}
+          value={corsProxy} onChange={e => saveCorsProxy(e.target.value)}
+          placeholder="例：https://your-worker.workers.dev/?url={url}  （{url} 会被替换为目标 URL）"/>
+        <div style={{fontSize:11,color:"var(--ink3)",lineHeight:1.6}}>
+          支持两种写法：<code style={{fontFamily:"var(--mono)",background:"var(--surface3)",padding:"1px 4px",borderRadius:3}}>https://proxy.example.com/?url={"{url}"}</code> 或 <code style={{fontFamily:"var(--mono)",background:"var(--surface3)",padding:"1px 4px",borderRadius:3}}>https://proxy.example.com</code>（自动追加 ?url=）
+        </div>
+      </Card>
+
+      <Card style={{marginTop:14}}>
+        <div style={S.cardH}><div><div style={S.cardTitle}>Cloudflare Worker 模板 · 解决 CORS</div><div style={S.cardSub}>把以下代码贴到 Cloudflare Workers 控制台，部署后把 *.workers.dev 域名填到上方"网页抓取代理"或各模型卡的"自定义 BaseURL"。</div></div></div>
+        <pre style={{fontFamily:"var(--mono)",fontSize:11,lineHeight:1.6,background:"oklch(0.18 0.005 60)",color:"oklch(0.94 0.01 80)",padding:14,borderRadius:10,overflow:"auto",margin:0}}>
+{`// Cloudflare Worker · 通用 OpenAI / Anthropic / 国产大模型 / URL 抓取代理
+// 部署后地址例：https://my-proxy.workers.dev
+// 用法 1（模型代理）：把它填到模型卡的"自定义 BaseURL"，比如 OpenAI 卡填 https://my-proxy.workers.dev/openai
+// 用法 2（URL 抓取）：填到上方"网页抓取代理"：https://my-proxy.workers.dev/fetch?url={url}
+
+const TARGETS = {
+  "/openai":    "https://api.openai.com",
+  "/anthropic": "https://api.anthropic.com",
+  "/doubao":    "https://ark.cn-beijing.volces.com",
+  "/qwen":      "https://dashscope.aliyuncs.com",
+  "/deepseek":  "https://api.deepseek.com",
+  "/zhipu":     "https://open.bigmodel.cn",
+};
+
+export default {
+  async fetch(req) {
+    const u = new URL(req.url);
+    if (req.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
+
+    if (u.pathname === "/fetch") {
+      const target = u.searchParams.get("url");
+      if (!target) return cors(new Response("missing url", { status: 400 }));
+      const r = await fetch(target, { headers: { "User-Agent": "Mozilla/5.0" } });
+      return cors(new Response(await r.text(), { status: r.status, headers: { "Content-Type": "text/html; charset=utf-8" } }));
+    }
+
+    for (const [prefix, host] of Object.entries(TARGETS)) {
+      if (u.pathname.startsWith(prefix)) {
+        const fwd = host + u.pathname.slice(prefix.length) + u.search;
+        const r = await fetch(fwd, { method: req.method, headers: req.headers, body: req.body });
+        return cors(new Response(r.body, { status: r.status, headers: r.headers }));
+      }
+    }
+    return cors(new Response("ok", { status: 200 }));
+  }
+};
+
+function cors(res) {
+  const h = new Headers(res.headers);
+  h.set("Access-Control-Allow-Origin", "*");
+  h.set("Access-Control-Allow-Headers", "*");
+  h.set("Access-Control-Allow-Methods", "*");
+  return new Response(res.body, { status: res.status, headers: h });
+}`}
+        </pre>
+        <div style={{display:"flex",justifyContent:"flex-end",marginTop:10}}>
+          <Btn sm onClick={() => { try { navigator.clipboard.writeText(document.querySelector("pre")?.textContent || ""); } catch {} }}><I.Doc size={12}/> 复制代码</Btn>
+        </div>
+      </Card>
+
+      <Card style={{marginTop:14, background:"var(--mintSoft)", borderColor:"transparent"}}>
+        <div style={{fontSize:13, fontWeight:700, color:"var(--mintDeep)", marginBottom:6}}>📌 部署 Cloudflare Worker · 5 步走</div>
+        <div style={{fontSize:12,lineHeight:1.8,color:"var(--ink2)"}}>
+          1. 注册并登录 <a href="https://dash.cloudflare.com/" target="_blank" rel="noreferrer" style={{color:"var(--brandDeep)"}}>Cloudflare</a>，进入 Workers & Pages → Create<br/>
+          2. 选 "Hello World" 模板创建后，进 Edit Code，把上面整段代码粘进去 → Save and Deploy<br/>
+          3. 拿到 https://xxx.workers.dev 这个域名<br/>
+          4. 回这里：OpenAI 卡的 BaseURL 填 <code style={{fontFamily:"var(--mono)",background:"var(--surface3)",padding:"0 4px",borderRadius:3}}>https://xxx.workers.dev/openai</code>，Anthropic 填 <code style={{fontFamily:"var(--mono)",background:"var(--surface3)",padding:"0 4px",borderRadius:3}}>https://xxx.workers.dev/anthropic</code>，以此类推<br/>
+          5. 网页抓取代理填 <code style={{fontFamily:"var(--mono)",background:"var(--surface3)",padding:"0 4px",borderRadius:3}}>https://xxx.workers.dev/fetch?url={"{url}"}</code>
+        </div>
       </Card>
     </div>}
   </div>);
@@ -1685,7 +2121,7 @@ function MaterialPool() {
 /* ═══════════════ KnowledgeBase (知识库) ═══════════════ */
 function KnowledgeBase() {
   const { keys, routes } = useContext(ApiConfigContext);
-  const hasAI = Object.values(keys).some(k => k?.key);
+  const hasAI = isBackendMode() || Object.values(keys).some(k => k?.key);
   const [items, setItems] = useState([]);
   const [showAdd, setShowAdd] = useState(false);
   const [addMode, setAddMode] = useState("url"); // url | file | paste
@@ -1703,59 +2139,73 @@ function KnowledgeBase() {
   }, []);
   const save = (newItems) => { setItems(newItems); try { localStorage.setItem("kb-items", JSON.stringify(newItems)); } catch(e) {} };
 
-  // Add URL - fetch and summarize
+  // Add URL - real fetch via CORS proxy + AI summarize
   const addUrl = async () => {
     if (!urlInput.trim()) return;
     setLoading(true); setError(null);
     try {
-      // Use AI to summarize the URL content
-      let summary = "", title = urlInput;
-      if (hasAI) {
-        const result = await callAI({ keys, routes, scene: "选题挖掘", maxTokens: 800,
-          systemPrompt: "用户给你一个网址，请分析这个网址可能包含的内容，生成一个标题和摘要。返回JSON：{\"title\":\"xxx\",\"summary\":\"xxx\",\"category\":\"行业报告/平台政策/竞品分析/品牌资料/文案参考\"}。只返回JSON。",
-          prompt: `请分析这个网址并生成标题和摘要：${urlInput}`
-        });
-        try { const d = JSON.parse(result.replace(/```json|```/g,"").trim()); title = d.title || urlInput; summary = d.summary || ""; } catch {}
+      let fetched = null;
+      try {
+        const backend = getBackendBase();
+        const customProxy = backend
+          ? `${backend}/fetch?url={url}`
+          : (localStorage.getItem("kb-cors-proxy") || "");
+        fetched = await fetchUrlContent(urlInput.trim(), customProxy);
+      } catch (e) {
+        setError(`抓取失败：${e.message?.slice(0, 80) || "代理无法访问"}（已只保存链接，可手动改写摘要）`);
       }
-      const newItem = { id: Date.now(), type: "url", icon: "🌐", title, url: urlInput, cat: "网页链接", summary: summary || "已添加，等待索引", tokens: "—", used: 0, content: "", addedAt: new Date().toISOString(), status: "已索引" };
+      let title = fetched?.title || urlInput;
+      let summary = fetched?.text ? fetched.text.slice(0, 100) + "…" : "已添加链接，未抓取到正文";
+      let content = fetched?.text || "";
+      if (hasAI && content.length > 40) {
+        try {
+          const result = await callAI({ keys, routes, scene: "选题挖掘", maxTokens: 400,
+            systemPrompt: "根据网页正文生成简短标题和一句话摘要。返回JSON：{\"title\":\"xxx\",\"summary\":\"xxx\",\"category\":\"行业报告/平台政策/竞品分析/品牌资料/文案参考\"}。只返回JSON。",
+            prompt: `网页URL：${urlInput}\n正文（截取）：${content.slice(0, 4000)}`
+          });
+          const d = JSON.parse(result.replace(/```json|```/g, "").trim());
+          if (d.title) title = d.title;
+          if (d.summary) summary = d.summary;
+        } catch {}
+      }
+      const tokens = content ? `${(content.length / 4).toFixed(1)}k` : "—";
+      const newItem = { id: Date.now(), type: "url", icon: "🌐", title, url: urlInput, cat: fetched ? "网页正文" : "网页链接", summary, tokens, used: 0, content, addedAt: new Date().toISOString(), status: fetched ? "已索引" : "未抓取" };
       save([newItem, ...items]);
       setUrlInput(""); setShowAdd(false);
-    } catch(e) { setError(e.message?.slice(0,100)); }
+    } catch(e) { setError(e.message?.slice(0,120)); }
     setLoading(false);
   };
 
-  // Add file
+  // Add file - real PDF/DOCX/XLSX parsing
   const handleFile = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
     setLoading(true); setError(null);
     const ext = file.name.split(".").pop().toLowerCase();
-    const iconMap = { pptx:"📊", ppt:"📊", docx:"📝", doc:"📝", xlsx:"📗", xls:"📗", txt:"📄", pdf:"📕", csv:"📗" };
-    const catMap = { pptx:"PPT文档", ppt:"PPT文档", docx:"Word文档", doc:"Word文档", xlsx:"Excel表格", xls:"Excel表格", txt:"文本文件", pdf:"PDF文档", csv:"CSV数据" };
+    const iconMap = { pptx:"📊", ppt:"📊", docx:"📝", doc:"📝", xlsx:"📗", xls:"📗", txt:"📄", pdf:"📕", csv:"📗", md:"📄", json:"📄" };
+    const catMap = { pptx:"PPT文档", ppt:"PPT文档", docx:"Word文档", doc:"Word文档", xlsx:"Excel表格", xls:"Excel表格", txt:"文本文件", pdf:"PDF文档", csv:"CSV数据", md:"Markdown", json:"JSON" };
     try {
-      let content = "";
-      if (["txt","csv"].includes(ext)) {
-        content = await file.text();
-      } else {
-        // For binary files, store basic info
-        content = `[${catMap[ext]||"文件"}] ${file.name} (${(file.size/1024).toFixed(1)}KB)`;
+      if (!isSupportedFile(file.name)) {
+        throw new Error(`暂不支持 .${ext}（已支持：pdf / docx / xlsx / xls / txt / csv / md / json）`);
       }
+      const content = await parseFile(file);
       const tokens = content ? `${(content.length/4).toFixed(1)}k` : "—";
-      let summary = `${file.name} · ${(file.size/1024).toFixed(1)}KB`;
-      // AI summarize if text content available
-      if (hasAI && content.length > 20 && content.length < 10000) {
+      let summary = content
+        ? content.replace(/\s+/g, " ").slice(0, 100) + (content.length > 100 ? "…" : "")
+        : `${file.name} · ${(file.size/1024).toFixed(1)}KB`;
+      if (hasAI && content.length > 40) {
         try {
           const result = await callAI({ keys, routes, scene: "选题挖掘", maxTokens: 300,
             systemPrompt: "用一句话概括以下内容的核心要点。只返回概括文字，不要JSON。",
-            prompt: content.slice(0, 3000)
+            prompt: content.slice(0, 4000)
           });
           if (result) summary = result.slice(0, 100);
         } catch {}
       }
-      const newItem = { id: Date.now(), type: "file", icon: iconMap[ext] || "📄", title: file.name.replace(/\.[^.]+$/, ""), cat: catMap[ext] || "文件", summary, tokens, used: 0, content: content.slice(0, 50000), addedAt: new Date().toISOString(), status: "已索引", fileSize: file.size, fileName: file.name };
+      const newItem = { id: Date.now(), type: "file", icon: iconMap[ext] || "📄", title: file.name.replace(/\.[^.]+$/, ""), cat: catMap[ext] || "文件", summary, tokens, used: 0, content, addedAt: new Date().toISOString(), status: "已索引", fileSize: file.size, fileName: file.name };
       save([newItem, ...items]);
       setShowAdd(false);
-    } catch(e) { setError("文件读取失败：" + e.message); }
+    } catch(e) { setError("文件读取失败：" + (e.message || "未知错误")); }
     setLoading(false);
     if (fileRef.current) fileRef.current.value = "";
   };
@@ -1816,14 +2266,15 @@ function KnowledgeBase() {
       </div>}
 
       {addMode==="file" && <div>
-        <input ref={fileRef} type="file" accept=".pptx,.ppt,.docx,.doc,.xlsx,.xls,.txt,.csv,.pdf" onChange={handleFile} style={{display:"none"}} />
+        <input ref={fileRef} type="file" accept=".docx,.xlsx,.xls,.txt,.csv,.pdf,.md,.json" onChange={handleFile} style={{display:"none"}} />
         <button onClick={() => fileRef.current?.click()} style={{width:"100%",padding:32,border:"2px dashed var(--lineStrong)",borderRadius:14,background:"var(--surface2)",cursor:"pointer",textAlign:"center"}}>
           <div style={{fontSize:36,marginBottom:8}}>📎</div>
           <div style={{fontSize:14,fontWeight:700,color:"var(--ink2)"}}>点击选择文件</div>
-          <div style={{fontSize:12,color:"var(--ink3)",marginTop:4}}>支持 .pptx .docx .xlsx .txt .csv .pdf</div>
-          <div style={{display:"flex",justifyContent:"center",gap:8,marginTop:10}}>
-            {["📊 PPT","📝 Word","📗 Excel","📄 TXT","📕 PDF"].map(f => <Chip key={f} style={{fontSize:10}}>{f}</Chip>)}
+          <div style={{fontSize:12,color:"var(--ink3)",marginTop:4}}>真解析：.pdf .docx .xlsx .xls .txt .csv .md .json</div>
+          <div style={{display:"flex",justifyContent:"center",gap:8,marginTop:10,flexWrap:"wrap"}}>
+            {["📕 PDF","📝 Word","📗 Excel","📄 TXT/MD/JSON","📗 CSV"].map(f => <Chip key={f} style={{fontSize:10}}>{f}</Chip>)}
           </div>
+          <div style={{fontSize:10,color:"var(--ink4)",marginTop:8}}>暂不支持 .ppt/.pptx/.doc（旧格式），请先另存为 .docx 或 .pdf</div>
         </button>
         {loading && <div style={{textAlign:"center",color:"var(--brand)",fontSize:13,fontWeight:600,marginTop:10}}>⏳ 正在读取并索引…</div>}
       </div>}
@@ -2036,56 +2487,153 @@ function TrackAnalysis() {
   </div>);
 }
 
-/* ═══════════════ Approval ═══════════════ */
-function Approval() {
-  const [sel, setSel] = useState(null);
-  const STAGES = [
-    { id:"draft", label:"草稿", color:"var(--ink3)" }, { id:"review", label:"待主编审核", color:"var(--amber)" },
-    { id:"compliance", label:"合规复审", color:"oklch(0.7 0.16 290)" }, { id:"approved", label:"已通过", color:"var(--mint)" },
-    { id:"published", label:"已发布", color:"var(--sky)" }, { id:"rejected", label:"已驳回", color:"var(--brand)" },
-  ];
-  const items = [
-    { id:"t1", title:"新手妈妈别再硬扛了！夜醒3次以上的你们这条一定要看", stage:"review", author:"张运营", aiScore:89, time:"2小时前", urgent:true },
-    { id:"t2", title:"考公面试结构化题：万能开头 5 个模板", stage:"compliance", author:"王运营", aiScore:92, time:"1天前" },
-    { id:"t3", title:"黄黑皮日常口红盲选清单", stage:"rejected", author:"刘运营", aiScore:71, time:"2天前" },
-    { id:"t4", title:"通勤打工人 5 分钟早餐", stage:"approved", author:"陈运营", aiScore:85, time:"今天 09:00" },
-  ];
-  const stg = id => STAGES.find(s=>s.id===id);
-  return (
-    <div style={S.page}>
-      <div style={{ display:"flex", justifyContent:"space-between", marginBottom:18 }}>
-        <div><h1 style={S.pageH1}>审批流 · 内容协作</h1><p style={S.pageSub}>运营提交 → 主编审核 → 合规复审 → 定时发布</p></div>
-        <div style={{ display:"flex", gap:8 }}><Btn><I.Settings size={14}/> 流程设置</Btn><Btn primary><I.Plus size={14}/> 提交新内容</Btn></div>
-      </div>
-      <div style={{ display:"grid", gridTemplateColumns:"repeat(6, 1fr)", gap:10, marginBottom:18 }}>
-        {STAGES.map(s => (
-          <Card key={s.id} style={{ padding:14, borderLeft:`3px solid ${s.color}` }}>
-            <div style={{ fontSize:11, color:"var(--ink3)", marginBottom:4 }}>{s.label}</div>
-            <div style={{ fontSize:24, fontWeight:700, color:s.color }}>{items.filter(t=>t.stage===s.id).length}</div>
-          </Card>
-        ))}
-      </div>
-      <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
-        {items.map(t => {
-          const si = stg(t.stage);
-          return (
-            <button key={t.id} onClick={() => setSel(sel===t.id ? null : t.id)} style={{ textAlign:"left", padding:14, borderRadius:12, border:`1.5px solid ${sel===t.id ? "var(--brand)" : "var(--line)"}`, background: sel===t.id ? "var(--brandTint)" : "var(--surface)", cursor:"pointer", position:"relative" }}>
-              {t.urgent && <span style={{ position:"absolute", top:10, right:10, padding:"2px 6px", borderRadius:4, background:"var(--brand)", color:"white", fontSize:9, fontWeight:700 }}>加急</span>}
-              <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:6 }}>
-                <Chip style={{ background:si.color+"1a", color:si.color }}>● {si.label}</Chip>
-                <Chip variant="mint" style={{ fontSize:10 }}>AI {t.aiScore}</Chip>
-              </div>
-              <div style={{ fontSize:14, fontWeight:600, lineHeight:1.5, marginBottom:8 }}>{t.title}</div>
-              <div style={{ display:"flex", gap:8, fontSize:11, color:"var(--ink3)" }}>
-                <span>{t.author}</span><span>·</span><span>{t.time}</span>
-              </div>
-            </button>
-          );
-        })}
-      </div>
+function TrackAnalysisPage() {
+  const { keys, routes } = useContext(ApiConfigContext);
+  const [track,setTrack]=useState("gongkao");
+  const [tab,setTab]=useState("overview");
+  const [keyword, setKeyword] = useState("公考");
+  const [kbItems, setKbItems] = useState([]);
+  const [selectedKb, setSelectedKb] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const hasAI = isBackendMode() || Object.values(keys).some(k => k?.key);
+  const tracks=[{id:"gongkao",name:"公考",emoji:"📎",hot:96,growth:"+18%"},{id:"kaoyan",name:"考研",emoji:"🎗",hot:91,growth:"+22%"},{id:"muying",name:"母婴",emoji:"👚",hot:88,growth:"+8%"},{id:"meizhuang",name:"美妆",emoji:"🫕",hot:94,growth:"+12%"},{id:"jiaoyu",name:"教育",emoji:"🎨",hot:90,growth:"+24%"},{id:"3c",name:"3C数码",emoji:"📫",hot:87,growth:"+16%"},{id:"jianshen",name:"健身",emoji:"💭",hot:86,growth:"+15%"},{id:"licai",name:"理财",emoji:"💵",hot:82,growth:"+28%"}];
+  const fallbackAnalysis = {
+    summary: "先聚焦高意图人群和更容易转化的细分选题，再决定内容节奏和投流预算。",
+    overviewAdvice: [
+      "优先做能直接承接需求的选题，不先铺大而泛的行业认知。",
+      "账号内容需要同时覆盖高热入口词和低竞争蓝海词。",
+      "投流测试建议先拿 3-5 个内容角度做小预算验证，再放大。"
+    ],
+    personas:[{name:"高意图决策人群",pct:32,color:"var(--brand)",hook:"预算有限但想尽快做出结果"},{name:"比较型人群",pct:24,color:"oklch(0.7 0.16 290)",hook:"同类产品到底怎么选"},{name:"新手入门人群",pct:18,color:"var(--amber)",hook:"完全不懂，从哪里开始"},{name:"经验复盘人群",pct:14,color:"var(--sky)",hook:"踩坑总结和真实反馈"},{name:"轻内容陪伴人群",pct:12,color:"var(--mint)",hook:"愿意持续看系列内容"}],
+    topics:[{t:"选购避坑清单",hot:95,note:"高转化"},{t:"适合谁 / 不适合谁",hot:91,note:"蓝海"},{t:"真实使用反馈",hot:88,note:"高互动"},{t:"预算分层推荐",hot:85,note:"本周+18%"},{t:"新手入门指南",hot:82,note:"稳定流量"},{t:"同类产品对比",hot:86,note:"竞争↑"},{t:"场景化解决方案",hot:80,note:"蓝海"},{t:"常见误区盘点",hot:78,note:"可系列化"}],
+    adMetrics:[{l:"建议月预算",v:"2-5w",bg:"var(--brandSoft)"},{l:"目标CPM",v:"¥18-25",bg:"var(--mintSoft)"},{l:"目标CPL",v:"¥8-18",bg:"var(--amberSoft)"}],
+    adPhases:[{p:"1-3天·测试",a:"用 3-5 个选题角度测点击和停留",c:"var(--sky)"},{p:"4-7天·加热",a:"把前 2 条优质内容加预算验证转化",c:"var(--amber)"},{p:"8-14天·放量",a:"围绕转化最好的人群和选题持续扩素材",c:"var(--brand)"},{p:"15天+·迭代",a:"根据评论、私信和表单反馈继续修正内容",c:"oklch(0.7 0.16 290)"}]
+  };
+  const [analysis, setAnalysis] = useState(fallbackAnalysis);
+  const T=tracks.find(x=>x.id===track);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("kb-items");
+      if (raw) setKbItems(JSON.parse(raw));
+    } catch {}
+    try {
+      const rawAnalysis = localStorage.getItem("track-analysis-result");
+      if (rawAnalysis) setAnalysis(JSON.parse(rawAnalysis));
+    } catch {}
+  }, []);
+
+  const selectedKnowledge = kbItems.find(item => String(item.id) === String(selectedKb));
+  const knowledgeText = selectedKnowledge ? [selectedKnowledge.title, selectedKnowledge.summary, selectedKnowledge.content].filter(Boolean).join("\n") : "";
+
+  const runAnalysis = async () => {
+    if (!keyword.trim() && !selectedKnowledge) return;
+    setLoading(true); setError(null);
+    if (!hasAI) {
+      const next = {
+        ...fallbackAnalysis,
+        summary: `当前赛道聚焦「${keyword || selectedKnowledge?.title || "目标赛道"}」，已结合知识库生成一版兜底分析。`,
+        topics: fallbackAnalysis.topics.map((item, i) => ({ ...item, t: i === 0 ? `${keyword || "目标赛道"} ${item.t}` : item.t })),
+      };
+      setAnalysis(next);
+      try { localStorage.setItem("track-analysis-result", JSON.stringify(next)); } catch {}
+      setLoading(false);
+      return;
+    }
+    try {
+      const result = await callAI({
+        keys, routes, scene: "选题挖掘", maxTokens: 2200,
+        systemPrompt: "你是小红书赛道分析专家。根据用户输入的赛道关键词和知识库资料，返回 JSON：{\"summary\":\"一句总结\",\"overviewAdvice\":[\"建议1\",\"建议2\",\"建议3\"],\"personas\":[{\"name\":\"人群\",\"pct\":32,\"color\":\"var(--brand)\",\"hook\":\"典型钩子\"}],\"topics\":[{\"t\":\"选题\",\"hot\":95,\"note\":\"蓝海/高转化/高互动/本周+18%\"}],\"adMetrics\":[{\"l\":\"建议月预算\",\"v\":\"2-5w\",\"bg\":\"var(--brandSoft)\"}],\"adPhases\":[{\"p\":\"1-3天·测试\",\"a\":\"动作建议\",\"c\":\"var(--sky)\"}]}。只返回 JSON。",
+        prompt: `赛道关键词：${keyword}\n当前预设赛道：${T?.name || ""}\n知识库资料：\n${knowledgeText.slice(0, 5000)}\n\n请输出可直接用于页面展示的赛道分析结果。`
+      });
+      const parsed = JSON.parse(result.replace(/```json|```/g, "").trim());
+      setAnalysis(parsed);
+      try { localStorage.setItem("track-analysis-result", JSON.stringify(parsed)); } catch {}
+    } catch(e) {
+      setError(e.message?.slice(0,120) || "AI 分析失败，已保留当前结果");
+    }
+    setLoading(false);
+  };
+
+  const personas = analysis.personas || fallbackAnalysis.personas;
+  const topics = analysis.topics || fallbackAnalysis.topics;
+  const adMetrics = analysis.adMetrics || fallbackAnalysis.adMetrics;
+  const adPhases = analysis.adPhases || fallbackAnalysis.adPhases;
+
+  return (<div style={S.page}>
+    <div style={{display:"flex",justifyContent:"space-between",marginBottom:18}}>
+      <div><h1 style={S.pageH1}>赛道分析 · 行业雷达</h1><p style={S.pageSub}>先确定赛道关键词，再结合知识库生成可执行的人群、选题和投流策略。</p></div>
+      <Btn primary onClick={runAnalysis} disabled={loading || (!keyword.trim() && !selectedKnowledge)}>{loading ? "分析中…" : <><I.Magic size={14}/> AI 定制策略</>}</Btn>
     </div>
-  );
+    <Card style={{marginBottom:14,border:"1.5px solid var(--brand)"}}>
+      <div style={S.cardH}><div><div style={S.cardTitle}>分析输入</div><div style={S.cardSub}>支持手动输入赛道、行业、产品方向，也可以引用知识库补充上下文。</div></div></div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 240px",gap:12}}>
+        <div><span style={S.label}>赛道关键词</span><input style={S.input} value={keyword} onChange={e=>setKeyword(e.target.value)} placeholder="例如：公考 / 母婴睡眠 / 千元平板 / 祛黄黑皮口红"/></div>
+        <div><span style={S.label}>引用知识库</span><select style={S.input} value={selectedKb} onChange={e=>setSelectedKb(e.target.value)}><option value="">不引用</option>{kbItems.map(item => <option key={item.id} value={item.id}>{item.title}</option>)}</select></div>
+      </div>
+      {selectedKnowledge && <div style={{marginTop:10,padding:"10px 12px",borderRadius:10,background:"var(--surface2)",fontSize:12,color:"var(--ink2)",lineHeight:1.6}}><b>已引用：</b>{selectedKnowledge.title}<br/>{selectedKnowledge.summary}</div>}
+      <div style={{marginTop:12,fontSize:12,color:"var(--ink3)"}}>{analysis.summary || fallbackAnalysis.summary}</div>
+      {error && <div style={{marginTop:10,padding:"8px 14px",borderRadius:8,background:"oklch(0.96 0.04 25)",color:"var(--brandDeep)",fontSize:12}}>⚠ {error}</div>}
+    </Card>
+    <Card style={{marginBottom:14}}>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10}}>
+        {tracks.map(t => <button key={t.id} onClick={()=>{setTrack(t.id); setKeyword(t.name);}} style={{padding:14,borderRadius:12,textAlign:"left",cursor:"pointer",border:`1.5px solid ${t.id===track?"var(--brand)":"var(--line)"}`,background:t.id===track?"var(--brandSoft)":"var(--surface)"}}>
+          <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:6}}><span style={{fontSize:20}}>{t.emoji}</span><span style={{fontSize:14,fontWeight:700}}>{t.name}</span></div>
+          <div style={{display:"flex",justifyContent:"space-between",fontSize:10}}><span style={{color:"var(--mintDeep)",fontWeight:700}}>{t.growth}</span><span style={{fontFamily:"var(--mono)",fontWeight:700}}>{t.hot}</span></div>
+          <div style={S.hairline}><span style={{display:"block",height:"100%",width:`${t.hot}%`,background:t.id===track?"var(--brand)":"var(--ink3)",borderRadius:999}}/></div>
+        </button>)}
+      </div>
+    </Card>
+    <div style={S.seg}>
+      {[{id:"overview",l:"📋 总览"},{id:"persona",l:"🎭 素人人设"},{id:"topic",l:"💡 选题趋势"},{id:"ad",l:"📊 投流策略"}].map(t => <button key={t.id} onClick={()=>setTab(t.id)} style={{...S.segBtn,...(tab===t.id?S.segOn:{})}}>{t.l}</button>)}
+    </div>
+    <div style={{marginTop:14}}>
+      {tab==="overview" && <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
+        <Card><div style={S.cardH}><div style={S.cardTitle}>主流人设占比</div></div>
+          {personas.map((p,i)=><div key={i} style={{marginBottom:10}}><div style={{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:4}}><span style={{fontWeight:600}}>{p.name}</span><span style={{fontFamily:"var(--mono)",fontWeight:700,color:p.color}}>{p.pct}%</span></div><div style={S.hairline}><span style={{display:"block",height:"100%",width:`${p.pct*3}%`,background:p.color,borderRadius:999}}/></div></div>)}
+        </Card>
+        <Card style={{background:"var(--mintSoft)",borderColor:"transparent"}}>
+          <div style={{fontSize:11,fontWeight:700,color:"var(--mintDeep)",marginBottom:8}}>本轮运营建议</div>
+          <div style={{fontSize:12,lineHeight:1.8}}>{(analysis.overviewAdvice || fallbackAnalysis.overviewAdvice).map((item, i) => <div key={i}>• {item}</div>)}</div>
+        </Card>
+      </div>}
+      {tab==="persona" && <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:14}}>
+        {personas.map((p,i) => <Card key={i} style={{borderTop:`3px solid ${p.color}`}}>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:10}}><div style={{fontSize:16,fontWeight:700}}>{p.name}</div><span style={{fontFamily:"var(--mono)",fontSize:16,fontWeight:700,color:p.color}}>{p.pct}%</span></div>
+          <div style={{padding:10,background:"var(--surface2)",borderRadius:8,marginBottom:10}}><div style={{fontSize:10,color:"var(--ink3)"}}>典型钩子</div><div style={{fontSize:13,fontFamily:"var(--mono)",color:"var(--ink)"}}>{p.hook}</div></div>
+          <Btn sm style={{width:"100%",justifyContent:"center"}}><I.Plus size={12}/> 用此人设起内容</Btn>
+        </Card>)}
+      </div>}
+      {tab==="topic" && <Card>
+        <div style={S.cardH}><div><div style={S.cardTitle}>选题热度排行 · 近 30 天</div></div></div>
+        {topics.map((t,i) => <div key={i} style={{display:"grid",gridTemplateColumns:"30px 1fr 80px 120px 100px",gap:12,alignItems:"center",padding:12,border:"1px solid var(--line)",borderRadius:10,marginBottom:8}}>
+          <span style={{fontFamily:"var(--mono)",fontSize:14,fontWeight:700,color:i<3?"var(--brand)":"var(--ink3)"}}>#{i+1}</span>
+          <div style={{fontSize:13,fontWeight:600}}>{t.t}</div>
+          <div><span style={{fontFamily:"var(--mono)",fontSize:14,fontWeight:700}}>{t.hot}</span><div style={S.hairline}><span style={{display:"block",height:"100%",width:`${t.hot}%`,background:"var(--brand)",borderRadius:999}}/></div></div>
+          <div>{t.note && <Chip variant={t.note==="蓝海"?"mint":"brand"} style={{fontSize:10}}>{t.note}</Chip>}</div>
+          <Btn sm primary style={{padding:"4px 8px"}}><I.Magic size={11}/> 生成</Btn>
+        </div>)}
+      </Card>}
+      {tab==="ad" && <div style={{display:"flex",flexDirection:"column",gap:14}}>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10}}>
+          {adMetrics.map(p => <Card key={p.l} style={{padding:16,background:p.bg,borderColor:"transparent"}}><div style={{fontSize:11,fontWeight:700,marginBottom:6}}>{p.l}</div><div style={{fontSize:20,fontWeight:700}}>{p.v}</div></Card>)}
+        </div>
+        <Card><div style={S.cardTitle}>投流节奏 · 4 个阶段</div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginTop:12}}>
+            {adPhases.map((r,i)=>
+              <div key={i} style={{padding:12,borderRadius:10,border:`1.5px solid ${r.c}33`,background:r.c+"0a"}}>
+                <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:8}}><span style={{fontFamily:"var(--mono)",width:22,height:22,borderRadius:50,background:r.c,color:"white",display:"grid",placeItems:"center",fontSize:11,fontWeight:700}}>{i+1}</span><span style={{fontSize:12,fontWeight:700,color:r.c}}>{r.p}</span></div>
+                <div style={{fontSize:11,color:"var(--ink2)",lineHeight:1.6}}>{r.a}</div>
+              </div>
+            )}
+          </div>
+        </Card>
+      </div>}
+    </div>
+  </div>);
 }
+
 
 /* ═══════════════ Library ═══════════════ */
 function LibraryPage() {
@@ -2189,10 +2737,9 @@ export default function App() {
           {page==="dash" && <Dashboard goto={goto}/>}
           {page==="feature1" && <Feature1/>}
           {page==="feature3" && <Feature3/>}
-          {page==="approval" && <Approval/>}
           {page==="knowledge" && <KnowledgeBase/>}
           {page==="accounts" && <AccountMatrix/>}
-          {page==="track" && <TrackAnalysis/>}
+          {page==="track" && <TrackAnalysisPage/>}
           {page==="reviewcenter" && <ReviewCenter/>}
           {page==="library" && <LibraryPage/>}
           {page==="materials" && <MaterialPool/>}
