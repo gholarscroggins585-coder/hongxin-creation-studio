@@ -658,9 +658,9 @@ function Dashboard({ goto }) {
 /* ═══════════════ Feature 1: 素人爆文 ═══════════════ */
 const STEPS_F1 = [
   { id:1, name:"选题输入", desc:"关键词或自定义选题" },
-  { id:2, name:"多 Agent 验证", desc:"5 个 Agent 联合打分" },
-  { id:3, name:"文案结构生成", desc:"钩子 / 正文 / 信任背书" },
-  { id:4, name:"批量出图", desc:"封面 + 内页 调用 GPT API" },
+  { id:2, name:"文案结构生成", desc:"钩子 / 正文 / 信任背书" },
+  { id:3, name:"批量出图", desc:"封面 + 内页 调用 GPT API" },
+  { id:4, name:"多 Agent 验证", desc:"对成品（文案+图）联合打分" },
   { id:5, name:"审阅导出", desc:"下载 / 直接发布" },
 ];
 
@@ -747,7 +747,7 @@ function Step1({ onNext }) {
       <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginTop:18 }}>
         {aiError && <div style={{ padding:"8px 14px", borderRadius:8, background:"oklch(0.96 0.04 25)", color:"var(--brandDeep)", fontSize:12, marginBottom:8 }}>⚠ {aiError}</div>}
         <span style={{ fontSize:12, color:"var(--ink3)" }}>已选 {sel.length} 条，下一步进入 5 Agent 联合验证</span>
-        <Btn primary style={{ padding:"11px 18px" }} disabled={sel.length===0} onClick={() => onNext({ keyword, category, topics: topics.filter(t => sel.includes(t.title)) })}>下一步：Agent 验证 <I.Arrow size={14}/></Btn>
+        <Btn primary style={{ padding:"11px 18px" }} disabled={sel.length===0} onClick={() => onNext({ keyword, category, topics: topics.filter(t => sel.includes(t.title)) })}>下一步：生成文案结构 <I.Arrow size={14}/></Btn>
       </div>
     </div>
   );
@@ -773,7 +773,7 @@ function Step2({ onNext, source }) {
         <div style={S.icoWrap}><I.Shield size={16}/></div>
         <div style={{ flex:1 }}>
           <div style={{ fontWeight:700 }}>当前选题：{source?.topics?.[0]?.title || source?.keyword || "请先在上一步选择一个选题"}</div>
-          <div style={{ color:"var(--ink3)", fontSize:12 }}>5 个 Agent 将依次验证，得分 ≥ 80 才进入下一步。</div>
+          <div style={{ color:"var(--ink3)", fontSize:12 }}>对已生成的文案 + 封面综合打分，得分 ≥ 80 才进入下一步。</div>
         </div>
         <Btn primary disabled={running} onClick={start}>{running ? "验证中…" : <><I.Bolt size={14}/> 开始验证</>}</Btn>
       </div>
@@ -813,7 +813,7 @@ function Step2({ onNext, source }) {
         <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
           <div style={{ padding:12, background:"var(--mintSoft)", borderRadius:10 }}>
             <div style={{ fontSize:11, fontWeight:700, color:"var(--mintDeep)", marginBottom:6 }}>✓ 优势</div>
-            <div style={{ fontSize:12, lineHeight:1.6 }}>• 选题命中近24h搜索曲线+127%<br/>• 痛点强烈、易引发母婴群体共鸣<br/>• 具备「踩坑→复盘」自然叙事结构</div>
+            <div style={{ fontSize:12, lineHeight:1.6 }}>• 钩子开篇贴近真实场景，停留率预估高<br/>• 文案+封面信息一致，主题表达清晰<br/>• 具备「踩坑→复盘」自然叙事结构</div>
           </div>
           <div style={{ padding:12, background:"var(--amberSoft)", borderRadius:10 }}>
             <div style={{ fontSize:11, fontWeight:700, color:"var(--amberDeep)", marginBottom:6 }}>⚡ 改进方向</div>
@@ -822,7 +822,7 @@ function Step2({ onNext, source }) {
         </div>
       </Card>
       <div style={{ display:"flex", justifyContent:"flex-end", marginTop:18 }}>
-        <Btn primary style={{ padding:"11px 18px" }} disabled={overall==null} onClick={onNext}>下一步：生成文案结构 <I.Arrow size={14}/></Btn>
+        <Btn primary style={{ padding:"11px 18px" }} disabled={overall==null} onClick={onNext}>下一步：审阅导出 <I.Arrow size={14}/></Btn>
       </div>
     </div>
   );
@@ -1092,7 +1092,7 @@ function Step4({ onNext, source }) {
         </div>
       </Card>
       <div style={{ display:"flex", justifyContent:"flex-end", marginTop:18 }}>
-        <Btn primary style={{ padding:"11px 18px" }} disabled={!done.every(d=>d)} onClick={() => onNext({ images, imagePrompts: editPrompts })}>下一步：审阅导出 <I.Arrow size={14}/></Btn>
+        <Btn primary style={{ padding:"11px 18px" }} disabled={!done.every(d=>d)} onClick={() => onNext({ images, imagePrompts: editPrompts })}>下一步：Agent 验证 <I.Arrow size={14}/></Btn>
       </div>
     </div>
   );
@@ -1244,9 +1244,9 @@ function Feature1() {
         </div>
         <div>
           {step===1 && <Step1 onNext={nextFromTopics}/>}
-          {step===2 && <Step2 source={source} onNext={() => adv(3)}/>}
-          {step===3 && <Step3 source={source} onNext={(note) => { mergeSource({ note }); adv(4); }}/>}
-          {step===4 && <Step4 source={source} onNext={(imageData) => { mergeSource(imageData); adv(5); }}/>}
+          {step===2 && <Step3 source={source} onNext={(note) => { mergeSource({ note }); adv(3); }}/>}
+          {step===3 && <Step4 source={source} onNext={(imageData) => { mergeSource(imageData); adv(4); }}/>}
+          {step===4 && <Step2 source={source} onNext={() => adv(5)}/>}
           {step===5 && <Step5 source={source}/>}
         </div>
       </div>
